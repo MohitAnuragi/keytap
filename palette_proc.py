@@ -71,6 +71,7 @@ BUILT_IN = [
     ("  Capture Settings  – stream quality",        "capture-settings"),
     ("  Action Recorder   – record & replay flows", "action-recorder"),
     ("  Perf Trace        – record & analyze jank",  "perf-trace"),
+    ("  Memory Profiler   – heap snapshots & leaks", "memory-profiler"),
 ]
 
 _BITRATE_PRESETS = [
@@ -154,6 +155,15 @@ class PaletteWindow:
         self._trace_frames = []
         self._trace_warns  = []
         self._trace_sort   = "dur"       # dur | time
+
+        # memory profiler state
+        self._heap_meta    = None        # sidecar dict of the open snapshot
+        self._heap_rows    = []          # class rows (or diff rows when _heap_old is set)
+        self._heap_warns   = []
+        self._heap_old     = None        # older snapshot meta while viewing a diff
+        self._heap_sort    = "retained"  # retained | shallow | cnt
+        self._heap_own     = True        # only classes under the app's package prefix
+        self._viewer_search = None       # (on_enter, fn(query)): viewer-specific search
 
         # actions state
         self._action_items       = []   # set by _enter_actions; init here avoids trace race
@@ -265,6 +275,9 @@ class PaletteWindow:
         root.bind("<Escape>",        self._on_escape)
         root.bind("<Command-r>",     self._on_refresh)
         root.bind("<Command-s>",     self._on_sort)
+        root.bind("<Command-o>",     self._on_toggle_own)
+        root.bind("<Command-d>",     self._on_diff)
+        root.bind("<Command-i>",     self._on_inspect)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Select first item
@@ -369,6 +382,8 @@ class PaletteWindow:
                 self._enter_stop_recording_name()
             elif vtype == "perf-trace":
                 self._enter_trace()
+            elif vtype == "memory-profiler":
+                self._enter_memory()
             else:
                 self._emit({"type": vtype})
         elif self.state == "actions":
@@ -398,7 +413,9 @@ class PaletteWindow:
                 self._emit({"type": "capture-settings", "stats_visible": not cur_sv})
         elif self.state == "input":
             text = self._var.get().strip()
-            if text:
+            if self._input_context == "heap-label":
+                self._emit({"type": "heap-snapshot", "label": text})
+            elif text:
                 if self._input_context == "stop-recording":
                     self._emit({"type": "stop-recording", "name": text})
                 elif self._input_context == "insert-wait":
@@ -466,6 +483,31 @@ class PaletteWindow:
         if self.state == "viewer" and self._viewer_on_enter == self._on_trace_frame:
             self._trace_sort = "time" if self._trace_sort == "dur" else "dur"
             self._show_trace_frames()
+        elif self.state == "viewer" and self._viewer_on_enter == self._on_heap_class:
+            order = ("retained", "shallow", "cnt")
+            self._heap_sort = order[(order.index(self._heap_sort) + 1) % len(order)]
+            self._show_heap_classes()
+        return "break"
+
+    def _on_toggle_own(self, _=None):
+        if self.state == "viewer" and self._viewer_on_enter == self._on_heap_class:
+            self._heap_own = not self._heap_own
+            self._show_heap_classes()
+        return "break"
+
+    def _on_diff(self, _=None):
+        if self.state == "viewer" and self._viewer_on_enter == self._on_heap_snapshot:
+            self._diff_selected_snapshot()
+        return "break"
+
+    def _on_inspect(self, _=None):
+        if self.state == "viewer" and self._viewer_on_enter == self._on_heap_instance:
+            sel = self._selected_idx()
+            raw_idx = self._resolve_raw_idx(sel) if sel is not None else None
+            if raw_idx is not None and raw_idx < len(self._viewer_raw_items):
+                inst = self._viewer_raw_items[raw_idx]
+                if isinstance(inst, dict):
+                    self._open_holds(inst["id"], root=True)
         return "break"
 
     def _on_close(self):
@@ -747,6 +789,9 @@ class PaletteWindow:
             self._lb.activate(0)
 
     def _refresh_viewer(self):
+        if self._viewer_search and self._viewer_search[0] == self._viewer_on_enter:
+            self._viewer_search[1](self._var.get().strip().lower())
+            return
         q = self._var.get().lower()
         self._viewer_shown_idx = [
             i for i, line in enumerate(self._viewer_all)
@@ -1250,6 +1295,417 @@ class PaletteWindow:
         self._set_trace_viewer("Frame slices", rows,
                                "longest main-thread / RenderThread slices  |  Esc=back",
                                on_back=self._show_trace_frames)
+
+    # ── Memory Profiler ───────────────────────────────────────────────────────
+
+    _HEAP_ROW_CAP = 1000
+
+    @staticmethod
+    def _fmt_bytes(n, signed=False):
+        sign = "+" if signed and n > 0 else ""
+        if abs(n) >= 1 << 20:
+            return f"{sign}{n / (1 << 20):.1f}MB"
+        if abs(n) >= 1 << 10:
+            return f"{sign}{n / (1 << 10):.0f}KB"
+        return f"{sign}{n}B"
+
+    def _fill_viewer(self, lines, raws):
+        self._viewer_all       = lines
+        self._viewer_raw_items = raws
+        self._viewer_shown_idx = list(range(len(lines)))
+        self._lb.delete(0, "end")
+        for line in lines:
+            self._lb.insert("end", line)
+        if lines:
+            self._lb.selection_set(0)
+            self._lb.activate(0)
+
+    def _enter_memory(self):
+        self._heap_meta = None
+        rows = [
+            ("  Heap Snapshot   – dump the foreground app's Java heap", "snapshot"),
+            ("  Snapshots       – top classes, reference paths, diff", "list"),
+        ]
+        self._set_trace_viewer("Memory Profiler", rows, "Enter=select  Esc=back",
+                               on_enter=self._on_memory_action)
+
+    def _on_memory_action(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        if self._viewer_raw_items[raw_idx] == "snapshot":
+            self._enter_heap_label()
+        else:
+            self._enter_heap_list()
+
+    def _enter_heap_label(self):
+        self.state = "input"
+        self._input_context = "heap-label"
+        self._var.set("")
+        self._prompt.config(text="snapshot label (optional) >")
+        self._lb.delete(0, "end")
+        self._lb.insert("end", "  e.g. after opening Orders, before back")
+        self._lb.insert("end", "  The app freezes for a few seconds while the heap is dumped")
+        self._lb.selection_set(0)   # _on_enter ignores Enter when nothing is selected
+        self._footer.config(text="Enter=dump  Esc=cancel")
+
+    def _enter_heap_list(self):
+        self._heap_meta = None
+        try:
+            from heap_dump import list_snapshots
+            snaps = list_snapshots()
+        except Exception:
+            snaps = []
+        self._heap_snaps = snaps
+        if not snaps:
+            self._set_trace_viewer("Snapshots", [("  No snapshots found", None)],
+                                   "Esc=back", on_back=self._enter_memory)
+            return
+        rows = []
+        for s in snaps:
+            java = s.get("meminfo", {}).get("java_kb")
+            heap = f"java {java / 1024:>4.0f}MB" if java else "java    ?"
+            rows.append((f"  {s.get('started_at', '')[5:16]}  {heap}  {s.get('package', '')}"
+                         f"  {s.get('label', '')}", s))
+        self._set_trace_viewer(
+            "Snapshots", rows,
+            f"{len(rows)} snapshots  |  Enter=open  Cmd+D=diff vs previous  Esc=back",
+            on_enter=self._on_heap_snapshot, on_back=self._enter_memory)
+
+    def _on_heap_snapshot(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx < len(self._viewer_raw_items):
+            self._open_heap(self._viewer_raw_items[raw_idx], None)
+
+    def _diff_selected_snapshot(self):
+        sel = self._selected_idx()
+        if sel is None:
+            return
+        raw_idx = self._resolve_raw_idx(sel)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        meta = self._viewer_raw_items[raw_idx]
+        snaps = self._heap_snaps
+        older = next((s for s in snaps[snaps.index(meta) + 1:]
+                      if s.get("package") == meta.get("package")), None)
+        if older is None:
+            self._footer.config(text=f"no older snapshot of {meta.get('package')} to diff against")
+            return
+        self._open_heap(meta, older)
+
+    def _open_heap(self, meta, old):
+        self._heap_meta, self._heap_old = meta, old
+        self._heap_rows = []
+        self._set_trace_viewer("Heap", [("  analyzing heap...  (first open takes a few seconds)", None)],
+                               "Esc=back", on_back=self._enter_heap_list)
+        threading.Thread(target=self._bg_heap_classes, args=(meta, old), daemon=True).start()
+
+    def _bg_heap_classes(self, meta, old):
+        rows, warns, err = [], [], None
+        try:
+            import heap_queries
+            rows, warns = heap_queries.classes(meta["path"])
+            if old:
+                old_rows, _ = heap_queries.classes(old["path"])
+                rows = heap_queries.diff(old_rows, rows)
+        except Exception as e:
+            err = str(e)
+        self.root.after(0, lambda: self._on_heap_classes(meta, old, rows, warns, err))
+
+    def _on_heap_classes(self, meta, old, rows, warns, err):
+        if self._heap_meta is not meta or self._heap_old is not old:
+            return   # user navigated away while analyzing
+        if err:
+            self._set_trace_viewer("Heap", [(f"  error: {err[:90]}", None)],
+                                   "Esc=back", on_back=self._enter_heap_list)
+            return
+        self._heap_rows  = rows
+        self._heap_warns = warns
+        self._heap_sort  = "retained"
+        self._show_heap_classes()
+
+    def _heap_prefix(self):
+        return ".".join(self._heap_meta.get("package", "").split(".")[:2])
+
+    def _heap_line(self, r):
+        diff = self._heap_old is not None
+        cnt = f"{r['cnt']:+d}" if diff else str(r["cnt"])
+        return (f"  {self._fmt_bytes(r['retained'], diff):>9} {self._fmt_bytes(r['shallow'], diff):>9}"
+                f" {cnt:>8}  {r['name']}")
+
+    def _heap_header(self):
+        meta, old = self._heap_meta, self._heap_old
+        if old:
+            head = (f"  diff: {old.get('label') or old.get('started_at', '')[5:16]}"
+                    f"  ->  {meta.get('label') or meta.get('started_at', '')[5:16]}")
+        else:
+            mi = meta.get("meminfo", {})
+            parts = [meta.get("package", "")]
+            for key, name in (("java_kb", "java"), ("native_kb", "native"), ("graphics_kb", "gfx")):
+                if key in mi:
+                    parts.append(f"{name} {mi[key] / 1024:.0f}MB")
+            for key, name in (("activities", "activities"), ("views", "views")):
+                if key in mi:
+                    parts.append(f"{name} {mi[key]}")
+            head = "  " + "  ".join(parts)
+        rows = [(head, None)]
+        if meta.get("label") and not old:
+            rows.append((f"  label: {meta['label']}", None))
+        rows += [(f"  ! {w}", None) for w in self._heap_warns]
+        sign = "+" if old else " "
+        rows.append((f"  {'retained':>9} {'shallow':>9} {sign}{'count':>7}  class", None))
+        return rows
+
+    def _show_heap_classes(self):
+        key = self._heap_sort
+        rows = sorted(self._heap_rows, key=lambda r: -r[key])
+        prefix = self._heap_prefix()
+        if self._heap_own and prefix:
+            shown = [r for r in rows if r["name"].startswith(prefix)]
+        else:
+            shown = rows
+        capped = shown[:self._HEAP_ROW_CAP]
+        head = self._heap_header()
+        self._heap_default = ([l for l, _ in head] + [self._heap_line(r) for r in capped],
+                              [None] * len(head) + capped)
+        scope = f"own: {prefix}" if self._heap_own and prefix else "all classes"
+        more = f", top {len(capped)} of {len(shown)}" if len(shown) > len(capped) else ""
+        self._heap_footer = (f"{scope}{more}  |  sort: {key} (Cmd+S)  |  Cmd+O=own/all  |  "
+                             f"type to search all  |  Enter=instances (Bitmap: sizes)  Esc=back")
+        self._viewer_search = (self._on_heap_class, self._heap_search)
+        self._set_trace_viewer("Heap diff" if self._heap_old else "Heap",
+                               list(zip(*self._heap_default)), self._heap_footer,
+                               on_enter=self._on_heap_class, on_back=self._enter_heap_list)
+
+    def _heap_search(self, q):
+        """Typed text searches every class, ignoring the own-code filter."""
+        if not q:
+            self._fill_viewer(*self._heap_default)
+            self._footer.config(text=self._heap_footer)
+            return
+        key = self._heap_sort
+        hits = sorted((r for r in self._heap_rows if q in r["name"].lower()), key=lambda r: -r[key])
+        capped = hits[:self._HEAP_ROW_CAP]
+        self._fill_viewer([self._heap_line(r) for r in capped], capped)
+        self._footer.config(text=f"{len(capped)} of {len(hits)} matches in all classes  |  "
+                                 f"Enter=instances  Esc=back")
+
+    def _on_heap_class(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        row = self._viewer_raw_items[raw_idx]
+        if not isinstance(row, dict) or row.get("cid") is None:
+            return
+        if row["name"] == "android.graphics.Bitmap":
+            self._open_bitmaps()
+            return
+        self._heap_class = row
+        self._set_trace_viewer("Instances", [("  querying instances...", None)],
+                               "Esc=back", on_back=self._show_heap_classes)
+        threading.Thread(target=self._bg_heap_instances, args=(self._heap_meta, row), daemon=True).start()
+
+    def _bg_heap_instances(self, meta, row):
+        insts, err = [], None
+        try:
+            import heap_queries
+            insts = heap_queries.instances(meta["path"], row["cid"])
+        except Exception as e:
+            err = str(e)
+        self.root.after(0, lambda: self._on_heap_instances(meta, insts, err))
+
+    def _on_heap_instances(self, meta, insts, err):
+        if self._heap_meta is not meta or self._viewer_on_back != self._show_heap_classes:
+            return
+        self._heap_insts = [(f"  {self._fmt_bytes(i['retained']):>9} {self._fmt_bytes(i['size']):>9}"
+                             f"  #{i['id']}  {i['rd']} hops from root", i) for i in insts]
+        self._heap_inst_err = err
+        self._show_heap_instances()
+
+    def _show_heap_instances(self):
+        c = self._heap_class
+        rows = [(f"  {c['name']}  -  {c['cnt']} instances, {self._fmt_bytes(c['retained'])} retained", None)]
+        if self._heap_inst_err:
+            rows.append((f"  error: {self._heap_inst_err[:90]}", None))
+        rows.append((f"  {'retained':>9} {'shallow':>9}  instance", None))
+        rows += self._heap_insts
+        self._set_trace_viewer("Instances", rows,
+                               f"largest {len(self._heap_insts)} by retained size  |  Enter=reference path  |  Cmd+I=what it holds  Esc=back",
+                               on_enter=self._on_heap_instance, on_back=self._show_heap_classes)
+
+    def _on_heap_instance(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        inst = self._viewer_raw_items[raw_idx]
+        if not isinstance(inst, dict):
+            return
+        self._open_heap_path(inst, f"{self._heap_class['name']} #{inst['id']}  -  "
+                                   f"{self._fmt_bytes(inst['retained'])} retained",
+                             self._show_heap_instances)
+
+    def _open_heap_path(self, inst, title, back):
+        self._set_trace_viewer("Reference path", [("  finding path to GC root...", None)],
+                               "Esc=back", on_back=back)
+        threading.Thread(target=self._bg_heap_path,
+                         args=(self._heap_meta, inst, title, back), daemon=True).start()
+
+    def _bg_heap_path(self, meta, inst, title, back):
+        res, err = None, None
+        try:
+            import heap_queries
+            res = heap_queries.ref_path(meta["path"], inst["id"])
+        except Exception as e:
+            err = str(e)
+        self.root.after(0, lambda: self._on_heap_path(meta, title, back, res, err))
+
+    def _on_heap_path(self, meta, title, back, res, err):
+        if self._heap_meta is not meta or self._viewer_on_back != back:
+            return
+        rows = [(f"  {title}", None)]
+        if err:
+            rows.append((f"  error: {err[:90]}", None))
+        else:
+            root, hops, complete = res
+            rows.append((f"  GC root: {root or '?'}", None))
+            for i, (cls, field) in enumerate(hops):
+                rows.append((f"  {'-> ' if i else '   '}{cls}" + (f"  .{field}" if field else ""), None))
+            if not complete:
+                rows.append(("  ! path incomplete (no referrer found closer to a root)", None))
+        self._set_trace_viewer("Reference path", rows,
+                               "what keeps this object alive, root first  |  Esc=back",
+                               on_back=back)
+
+    def _open_holds(self, obj_id, root=False):
+        if root:
+            self._holds_stack = []
+        self._holds_stack.append(obj_id)
+        self._set_trace_viewer("What it holds",
+                               [("  loading...  (first use builds an index of the snapshot, a few seconds)", None)],
+                               "Esc=back", on_back=self._holds_back)
+        threading.Thread(target=self._bg_holds, args=(self._heap_meta, obj_id), daemon=True).start()
+
+    def _holds_back(self):
+        self._holds_stack.pop()
+        if self._holds_stack:
+            self._open_holds(self._holds_stack.pop())
+        else:
+            self._show_heap_instances()
+
+    def _bg_holds(self, meta, obj_id):
+        res, err = None, None
+        try:
+            import heap_queries
+            res = heap_queries.holds(meta["path"], obj_id)
+        except Exception as e:
+            err = str(e)
+        self.root.after(0, lambda: self._on_holds(meta, obj_id, res, err))
+
+    def _on_holds(self, meta, obj_id, res, err):
+        if (self._heap_meta is not meta or not self._holds_stack or self._holds_stack[-1] != obj_id
+                or self._viewer_on_back != self._holds_back):
+            return
+        if err:
+            self._set_trace_viewer("What it holds", [(f"  error: {err[:90]}", None)],
+                                   "Esc=back", on_back=self._holds_back)
+            return
+        b = self._fmt_bytes
+        h = res["head"]
+        crumbs = f"  (depth {len(self._holds_stack)})" if len(self._holds_stack) > 1 else ""
+        rows = [(f"  {h['cname']} #{h['id']}  -  shallow {b(h['size'])}, retained {b(h['retained'])}, "
+                 f"{h['objs']} objects{crumbs}", None)]
+
+        def field_row(x):
+            return (f"  {b(x['excl']) if x['excl'] else 'shared':>8}  {x['field'][:26]:<26} -> {x['cname']}  #{x['id']}", x)
+
+        rows.append(("  fields it exclusively keeps alive (size freed with it)", None))
+        rows += [field_row(x) for x in res["owned"]]
+        if res["owned_more"]:
+            rows.append((f"  ... {res['owned_more']} more owned fields not shown", None))
+        if not res["owned"]:
+            rows.append(("  (none: it references nothing that only it keeps alive)", None))
+        rows.append(("  everything it exclusively retains, by class", None))
+        rows += [(f"  {b(c['size']):>8}  x{c['cnt']:<6} {c['cname']}", None) for c in res["by_class"]]
+        if res["shared"]:
+            rows.append(("  fields shared with other objects (not freed with it)", None))
+            rows += [field_row(x) for x in res["shared"]]
+            if res["shared_more"]:
+                rows.append((f"  ... {res['shared_more']} more shared fields not shown", None))
+        self._set_trace_viewer("What it holds", rows,
+                               "Enter=open field  |  Esc=back one level",
+                               on_enter=self._on_holds_field, on_back=self._holds_back)
+
+    def _on_holds_field(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        x = self._viewer_raw_items[raw_idx]
+        if isinstance(x, dict):
+            self._open_holds(x["id"])
+
+    def _open_bitmaps(self):
+        meta = self._heap_meta
+        self._set_trace_viewer("Bitmaps", [("  querying bitmaps...", None)],
+                               "Esc=back", on_back=self._show_heap_classes)
+        threading.Thread(target=self._bg_heap_bitmaps, args=(meta,), daemon=True).start()
+
+    def _bg_heap_bitmaps(self, meta):
+        rows, err = [], None
+        try:
+            import heap_queries
+            rows = heap_queries.bitmaps(meta["path"])
+        except Exception as e:
+            err = str(e)
+        self.root.after(0, lambda: self._on_heap_bitmaps(meta, rows, err))
+
+    def _on_heap_bitmaps(self, meta, rows, err):
+        if self._heap_meta is not meta or self._viewer_on_back != self._show_heap_classes:
+            return
+        self._heap_bitmaps = rows
+        self._heap_bitmaps_err = err
+        self._show_heap_bitmaps()
+
+    def _bitmap_flags(self, b, screen_px):
+        flags = []
+        if screen_px and b["w"] * b["h"] > screen_px:
+            flags.append(">screen")
+        if b["bpp"] not in (0, 4):
+            flags.append(f"{b['bpp']}B/px")
+        if b["dup"] >= 3:
+            flags.append(f"x{b['dup']} same size")
+        return ", ".join(flags)
+
+    def _show_heap_bitmaps(self):
+        meta, bms = self._heap_meta, self._heap_bitmaps
+        screen = meta.get("screen")
+        screen_px = screen[0] * screen[1] if screen else 0
+        total = sum(b["size"] for b in bms)
+        big = sum(1 for b in bms if screen_px and b["w"] * b["h"] > screen_px)
+        head = f"  {len(bms)} bitmaps, {self._fmt_bytes(total)} total"
+        if screen:
+            head += f"  |  {big} larger than the screen ({screen[0]}x{screen[1]})"
+        else:
+            head += "  |  screen size unknown for this snapshot (re-dump to flag oversized bitmaps)"
+        rows = [(head, None)]
+        if self._heap_bitmaps_err:
+            rows.append((f"  error: {self._heap_bitmaps_err[:90]}", None))
+        rows.append((f"  {'size':>8}  {'dimensions':<11} flags", None))
+        for b in bms:
+            rows.append((f"  {self._fmt_bytes(b['size']):>8}  {str(b['w']) + 'x' + str(b['h']):<11} "
+                         f"{self._bitmap_flags(b, screen_px)}  #{b['id']}", b))
+        self._set_trace_viewer("Bitmaps", rows,
+                               "largest first  |  type to filter (e.g. >screen)  |  Enter=who holds it  Esc=back",
+                               on_enter=self._on_heap_bitmap, on_back=self._show_heap_classes)
+
+    def _on_heap_bitmap(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        b = self._viewer_raw_items[raw_idx]
+        if not isinstance(b, dict):
+            return
+        self._open_heap_path(b, f"Bitmap #{b['id']}  {b['w']}x{b['h']}  {self._fmt_bytes(b['size'])}",
+                             self._show_heap_bitmaps)
 
     def _enter_capture_settings(self):
         self.state = "capture-settings"

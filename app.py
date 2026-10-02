@@ -608,6 +608,19 @@ class KeyTap:
                     self._set_status(f"trace stop failed: {e}")
             threading.Thread(target=_stop_trace, daemon=True).start()
 
+        elif t == 'heap-snapshot':
+            label = result.get('label', '')
+            self._set_status("dumping heap...  (app freezes for a few seconds)")
+
+            def _heap_snapshot():
+                try:
+                    from heap_dump import capture
+                    path = capture(ARGS.serial, label)
+                    self._set_status(f"heap saved: {os.path.basename(path)}  (double-shift -> Memory Profiler -> Snapshots)")
+                except Exception as e:
+                    self._set_status(f"heap dump failed: {e}")
+            threading.Thread(target=_heap_snapshot, daemon=True).start()
+
         elif t == 'replay':
             path = result.get('path', '')
             mode = result.get('mode', 'timed')
