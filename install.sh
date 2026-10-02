@@ -35,7 +35,7 @@ info "Python $PY_VER found at $PYTHON"
 
 info "Installing Python dependencies..."
 
-PKGS=("av>=18.0" "numpy>=1.24" "Pillow>=9.0" "pygame>=2.0" "uiautomator2>=2.0" "mitmproxy>=10.0")
+PKGS=("av>=18.0" "numpy>=1.24" "Pillow>=9.0" "pygame>=2.0" "uiautomator2>=2.0" "mitmproxy>=10.0" "perfetto>=0.5")
 
 # Try plain install first; if PEP 668 blocks it (Homebrew/system Python),
 # retry with --user --break-system-packages which installs to ~/Library/Python.

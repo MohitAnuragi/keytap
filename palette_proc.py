@@ -70,6 +70,7 @@ BUILT_IN = [
     ("  Theme             – switch color theme",  "theme-switcher"),
     ("  Capture Settings  – stream quality",        "capture-settings"),
     ("  Action Recorder   – record & replay flows", "action-recorder"),
+    ("  Perf Trace        – record & analyze jank",  "perf-trace"),
 ]
 
 _BITRATE_PRESETS = [
@@ -146,6 +147,13 @@ class PaletteWindow:
         self._viewer_raw_items    = []   # raw (label, state) pairs, parallel to _viewer_all
         self._viewer_shown_idx    = []   # _viewer_all index for each listbox row (after filter)
         self._viewer_on_enter     = None # callable(raw_idx) or None for read-only viewers
+        self._viewer_on_back      = None # callable() for Esc one level up, None = back to search
+
+        # perf trace state
+        self._trace_path   = None
+        self._trace_frames = []
+        self._trace_warns  = []
+        self._trace_sort   = "dur"       # dur | time
 
         # actions state
         self._action_items       = []   # set by _enter_actions; init here avoids trace race
@@ -191,6 +199,9 @@ class PaletteWindow:
         # Pin [STOP RECORDING] at top while a recording is active.
         if data.get("recording_active"):
             self._all_items.insert(0, ("  [STOP RECORDING]", "stop-recording", None))
+            self._shown = list(self._all_items)
+        if data.get("trace_active"):
+            self._all_items.insert(0, ("  [STOP TRACE]", "stop-trace", None))
             self._shown = list(self._all_items)
 
         # ── Build UI ──────────────────────────────────────────────────────────
@@ -253,6 +264,7 @@ class PaletteWindow:
         root.bind("<Return>",        self._on_enter)
         root.bind("<Escape>",        self._on_escape)
         root.bind("<Command-r>",     self._on_refresh)
+        root.bind("<Command-s>",     self._on_sort)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Select first item
@@ -355,6 +367,8 @@ class PaletteWindow:
                 self._enter_recorder()
             elif vtype == "stop-recording":
                 self._enter_stop_recording_name()
+            elif vtype == "perf-trace":
+                self._enter_trace()
             else:
                 self._emit({"type": vtype})
         elif self.state == "actions":
@@ -428,6 +442,8 @@ class PaletteWindow:
             else:
                 self._send_hover(None)
                 self._enter_search()
+        elif self.state == "viewer" and self._viewer_on_back:
+            self._viewer_on_back()
         elif self.state in ("actions", "input", "viewer", "capture-settings"):
             self._enter_search()
         else:
@@ -446,6 +462,12 @@ class PaletteWindow:
             self._enter_hierarchy_loading()
         return "break"
 
+    def _on_sort(self, _=None):
+        if self.state == "viewer" and self._viewer_on_enter == self._on_trace_frame:
+            self._trace_sort = "time" if self._trace_sort == "dur" else "dur"
+            self._show_trace_frames()
+        return "break"
+
     def _on_close(self):
         self._emit(None)
 
@@ -454,6 +476,7 @@ class PaletteWindow:
     def _enter_search(self):
         self.state   = "search"
         self.sel_pkg = None
+        self._viewer_on_back = None
         self._var.set("")
         self._prompt.config(text=">")
         self._refresh_search()
@@ -1039,6 +1062,168 @@ class PaletteWindow:
         except Exception:
             pass
         self._emit({"type": "theme-changed", "theme": name})
+
+    # ── Perf Trace ────────────────────────────────────────────────────────────
+
+    def _set_trace_viewer(self, prompt, rows, footer, on_enter=None, on_back=None):
+        """rows: [(label, raw)]. raw=None rows are informational and ignored on Enter."""
+        self._viewer_raw_items = [r for _, r in rows]
+        self._viewer_all       = [l for l, _ in rows]
+        self._viewer_shown_idx = list(range(len(rows)))
+        self._viewer_on_enter  = on_enter
+        self._viewer_on_back   = on_back
+        self.state = "viewer"
+        self._var.set("")
+        self._prompt.config(text=f"{prompt}  >")
+        self._lb.delete(0, "end")
+        for label, _ in rows:
+            self._lb.insert("end", label)
+        self._footer.config(text=footer)
+        if rows:
+            self._lb.selection_set(0)
+            self._lb.activate(0)
+
+    def _enter_trace(self):
+        self._trace_path = None
+        if self.data.get("trace_active"):
+            rows = [("  [Stop trace]     – stop and save", "stop")]
+        else:
+            rows = [
+                ("  Start (light)   – frame timeline, low overhead", "light"),
+                ("  Start (full)    – adds CPU scheduling, higher overhead", "full"),
+            ]
+        rows.append(("  Results         – janky frames in saved traces", "results"))
+        self._set_trace_viewer("Perf Trace", rows, "Enter=select  Esc=back",
+                               on_enter=self._on_trace_action)
+
+    def _on_trace_action(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        action = self._viewer_raw_items[raw_idx]
+        if action in ("light", "full"):
+            self._emit({"type": "start-trace", "preset": action})
+        elif action == "stop":
+            self._emit({"type": "stop-trace"})
+        elif action == "results":
+            self._enter_trace_results()
+
+    def _enter_trace_results(self):
+        try:
+            from perf_trace import list_traces
+            traces = list_traces()
+        except Exception:
+            traces = []
+        if not traces:
+            self._set_trace_viewer("Traces", [("  No traces found", None)],
+                                   "Esc=back", on_back=self._enter_trace)
+            return
+        rows = []
+        for t in traces:
+            tags = []
+            if t.get("debuggable"):
+                tags.append("debuggable")
+            if (t.get("sdk") or 99) < 31:
+                tags.append("sdk<31")
+            tag = f"  [{', '.join(tags)}]" if tags else ""
+            rows.append((f"  {t.get('started_at', '')[:16]}  {t.get('preset', ''):<5} "
+                         f"{t.get('duration_s', 0):>6.1f}s  {t.get('package', '') or '-'}{tag}", t))
+        self._set_trace_viewer("Traces", rows,
+                               f"{len(rows)} traces  |  Enter=analyze  Esc=back",
+                               on_enter=self._on_trace_selected, on_back=self._enter_trace)
+
+    def _on_trace_selected(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        meta = self._viewer_raw_items[raw_idx]
+        self._trace_path = meta["path"]
+        self._trace_meta = meta
+        self._set_trace_viewer("Janky frames", [("  analyzing trace...  (first run downloads trace_processor)", None)],
+                               "Esc=back", on_back=self._enter_trace_results)
+        threading.Thread(target=self._bg_analyze, args=(meta["path"],), daemon=True).start()
+
+    def _bg_analyze(self, path):
+        err = None
+        try:
+            import trace_queries
+            frames, warns = trace_queries.analyze(path)
+        except Exception as e:
+            frames, warns, err = [], [], str(e)
+        self.root.after(0, lambda: self._on_trace_analyzed(path, frames, warns, err))
+
+    def _on_trace_analyzed(self, path, frames, warns, err):
+        if self._trace_path != path:
+            return   # user navigated away while analyzing
+        if err:
+            self._set_trace_viewer("Janky frames", [(f"  error: {err[:90]}", None)],
+                                   "Esc=back", on_back=self._enter_trace_results)
+            return
+        meta = self._trace_meta
+        if meta.get("debuggable"):
+            warns.append("debuggable build: timings are pessimistic, prefer a profileable build")
+        if meta.get("features"):
+            warns.append("captured with: " + ", ".join(meta["features"]))
+        self._trace_frames = frames
+        self._trace_warns  = warns
+        self._show_trace_frames()
+
+    @staticmethod
+    def _fmt_rel(ns):
+        s = max(0, ns) / 1e9
+        return f"{int(s // 60):02d}:{s % 60:04.1f}"
+
+    def _show_trace_frames(self):
+        frames = sorted(self._trace_frames,
+                        key=(lambda f: -f["dur"]) if self._trace_sort == "dur"
+                        else (lambda f: f["rel_ts"]))
+        rows = [(f"  ! {w}", None) for w in self._trace_warns]
+        if not frames:
+            rows.append(("  no janky frames found", None))
+        for f in frames:
+            rows.append((f"  {self._fmt_rel(f['rel_ts']):>8}  {f['dur'] / 1e6:6.1f}ms  "
+                         f"{f['jank_type'][:24]:<24}  {f['process'][-28:]}", f))
+        self._set_trace_viewer(
+            "Janky frames", rows,
+            f"{len(frames)} janky frames  |  sort: {self._trace_sort} (Cmd+S)  |  Enter=slices  Esc=back",
+            on_enter=self._on_trace_frame, on_back=self._enter_trace_results)
+
+    def _on_trace_frame(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        frame = self._viewer_raw_items[raw_idx]
+        if not isinstance(frame, dict):
+            return
+        self._set_trace_viewer("Frame slices", [("  querying slices...", None)],
+                               "Esc=back", on_back=self._show_trace_frames)
+        threading.Thread(target=self._bg_slices, args=(frame,), daemon=True).start()
+
+    def _bg_slices(self, frame):
+        path = self._trace_path
+        err = None
+        try:
+            import trace_queries
+            slices = trace_queries.frame_slices(path, frame)
+        except Exception as e:
+            slices, err = [], str(e)
+        self.root.after(0, lambda: self._on_trace_slices(path, frame, slices, err))
+
+    def _on_trace_slices(self, path, frame, slices, err):
+        if self._trace_path != path or self._viewer_on_back != self._show_trace_frames:
+            return
+        head = (f"  frame @ {self._fmt_rel(frame['rel_ts'])}  {frame['dur'] / 1e6:.1f}ms  "
+                f"{frame['jank_type']}  {frame['process']}")
+        rows = [(head, None)]
+        if err:
+            rows.append((f"  error: {err[:90]}", None))
+        elif not slices:
+            rows.append(("  no app slices in this window (try the full preset, or the app emits no trace sections)", None))
+        for s in slices:
+            rows.append((f"  {s['dur'] / 1e6:7.1f}ms  {s['thread'][:12]:<12} d{s['depth']}  {s['name'][:60]}", None))
+        self._set_trace_viewer("Frame slices", rows,
+                               "longest main-thread / RenderThread slices  |  Esc=back",
+                               on_back=self._show_trace_frames)
 
     def _enter_capture_settings(self):
         self.state = "capture-settings"

@@ -100,6 +100,10 @@ class KeyTap:
         self.video_recorder = VideoRecorder()
         self._video_active  = False
 
+        # Perfetto system trace (jank analysis)
+        from perf_trace import PerfettoCapture
+        self.perf_trace = PerfettoCapture()
+
         # Status font
         self._status_font = self._try_font(11)
 
@@ -347,6 +351,7 @@ class KeyTap:
             "capture_encode_scale":  self.capture.encode_scale,
             "capture_stats_visible": self._stats_visible,
             "recording_active":      self.recorder.active,
+            "trace_active":          self.perf_trace.active,
         }
         if self._palette_proc and self._palette_ready:
             # Fast path: pre-warmed subprocess already has Python + tkinter loaded.
@@ -574,6 +579,34 @@ class KeyTap:
                 self._set_status(f"saved: {os.path.basename(path)}{suffix}")
             except Exception as e:
                 self._set_status(f"save failed: {e}")
+
+        elif t == 'start-trace':
+            preset   = result.get('preset', 'light')
+            features = [f"mirroring ({ARGS.backend})"]
+            if self.recorder.active:
+                features.append("action recorder")
+            if self._video_active:
+                features.append("video recording")
+            self._set_status(f"starting {preset} trace...")
+
+            def _start_trace():
+                try:
+                    self.perf_trace.start(ARGS.serial, preset, features)
+                    self._set_status(f"tracing ({preset})...  (double-shift -> STOP TRACE to save)")
+                except Exception as e:
+                    self._set_status(f"trace start failed: {e}")
+            threading.Thread(target=_start_trace, daemon=True).start()
+
+        elif t == 'stop-trace':
+            self._set_status("stopping trace...")
+
+            def _stop_trace():
+                try:
+                    path = self.perf_trace.stop()
+                    self._set_status(f"trace saved: {os.path.basename(path)}  (double-shift -> Perf Trace -> Results)")
+                except Exception as e:
+                    self._set_status(f"trace stop failed: {e}")
+            threading.Thread(target=_stop_trace, daemon=True).start()
 
         elif t == 'replay':
             path = result.get('path', '')
