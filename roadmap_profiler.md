@@ -8,7 +8,7 @@ On-device profiling driven from the keytap command palette, built on Perfetto. T
 
 Frame timeline + atrace capture for jank analysis. See `perf_trace.py` and `trace_queries.py`.
 
-- Capture: `perfetto --detach=keytap`, stop with `perfetto --attach=keytap --stop`. Saved to `~/.keytap/traces/` with a JSON sidecar.
+- Capture: `perfetto --detach=keytap`, stop with `perfetto --attach=keytap --stop`. Saved to `data/traces/` with a JSON sidecar.
 - Do not stop perfetto with `adb shell kill`. It fails with `Permission denied` on some devices (seen on Xiaomi), and the resulting partial file has no frametimeline data.
 - Viewer: janky frames ranked worst first, with the longest main-thread and RenderThread slices per frame.
 
@@ -18,7 +18,7 @@ Frame timeline + atrace capture for jank analysis. See `perf_trace.py` and `trac
 
 Find which objects use the most memory, and find leaks. Java heap first.
 
-v1 status: items 1-6 below are implemented (`heap_dump.py`, `heap_queries.py`, Memory Profiler in the palette). Keys in the class view: Cmd+S cycles sort, Cmd+O toggles own/all classes, typing searches all classes. Cmd+D in the snapshot list diffs against the previous snapshot of the same app. Own-code prefix is the first two segments of the package (`com.gojek`). Snapshots are capped at 10 in `~/.keytap/heaps/`. The dump pins the target by pid (`java_hprof` matched nothing with `process_cmdline` on the test device). Dump time on a 42MB heap: about 13s end to end.
+v1 status: items 1-6 below are implemented (`heap_dump.py`, `heap_queries.py`, Memory Profiler in the palette). Keys in the class view: Cmd+S cycles sort, Cmd+O toggles own/all classes, typing searches all classes. Cmd+D in the snapshot list diffs against the previous snapshot of the same app. Own-code prefix is the first two segments of the package (`com.gojek`). Snapshots are capped at 10 in `data/heaps/`. The dump pins the target by pid (`java_hprof` matched nothing with `process_cmdline` on the test device). Dump time on a 42MB heap: about 13s end to end.
 
 ### Approach
 
@@ -39,7 +39,7 @@ Cmd+I on an instance shows what that object keeps alive: its fields with the siz
 
 ### Detail Snapshot (shipped, POC-grade)
 
-Full HPROF via `am dumpheap` (`hprof_dump.py`), read by our own parser (`hprof_parser.py`) and analysed in a subprocess (`hprof_analysis.py`, about 5s, cached as `<dump>.detail.json`). It keeps primitives and string contents that the Perfetto dump drops. Screens: Activities (destroyed or finished but alive), RecyclerViews (id, size, adapter, live rows and their text, cached and pooled holders), Bitmaps (Glide source URL, hosting view size, pixel ratio, OVERSIZED flag), Duplicate strings with values. Both snapshot kinds run inside the palette with a live progress screen. Known limits: URL lookup is a heuristic on Glide request objects (21 of 128 bitmaps on the test build), adapters stay obfuscated without a mapping file, resource ids show as hex, the analysis peaks around 1.6GB for a 112MB dump, and dumps contain user data so they stay local (5 kept in `~/.keytap/hprofs/`). Retained sizes and reference paths still come from the Perfetto snapshot.
+Full HPROF via `am dumpheap` (`hprof_dump.py`), read by our own parser (`hprof_parser.py`) and analysed in a subprocess (`hprof_analysis.py`, about 5s, cached as `<dump>.detail.json`). It keeps primitives and string contents that the Perfetto dump drops. Screens: Activities (destroyed or finished but alive), RecyclerViews (id, size, adapter, live rows and their text, cached and pooled holders), Bitmaps (Glide source URL, hosting view size, pixel ratio, OVERSIZED flag), Duplicate strings with values. Both snapshot kinds run inside the palette with a live progress screen. Known limits: URL lookup is a heuristic on Glide request objects (21 of 128 bitmaps on the test build), adapters stay obfuscated without a mapping file, resource ids show as hex, the analysis peaks around 1.6GB for a 112MB dump, and dumps contain user data so they stay local (5 kept in `data/hprofs/`). Retained sizes and reference paths still come from the Perfetto snapshot.
 
 ### Cheaper layers
 
@@ -81,7 +81,7 @@ After v1:
 
 - Exact `trace_processor` table names for heap graphs and dominator trees in the installed `perfetto` package
 - That `java_hprof` works on the target device (Xiaomi, Android 14) for a debuggable app
-- Dump file size on a real app heap; storage under `~/.keytap/heaps/` with a retention cap
+- Dump file size on a real app heap; storage under `data/heaps/` with a retention cap
 
 ### Open decisions
 

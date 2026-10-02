@@ -1365,7 +1365,9 @@ def main():
     if len(sys.argv) > 1:
         dir_path = sys.argv[1]
     else:
-        dir_path = filedialog.askdirectory(title="Select recording directory")
+        from paths import RECORDINGS_DIR
+        dir_path = filedialog.askdirectory(title="Select recording directory",
+                                           initialdir=str(RECORDINGS_DIR))
         if not dir_path:
             root.destroy()
             return

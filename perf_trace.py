@@ -1,7 +1,7 @@
 """
 PerfettoCapture: on-device Perfetto system trace (frame timeline + atrace).
 Records to a file on the device (no live streaming over USB), pulls it on stop
-into ~/.keytap/traces/ with a JSON sidecar describing how it was captured.
+into <keytap folder>/data/traces/ with a JSON sidecar describing how it was captured.
 """
 
 import json
@@ -13,11 +13,12 @@ import time
 from typing import List, Optional
 
 from config import ADB_PATH
+from paths import TRACES_DIR as _TRACES_DIR
 from utils import adb_shell
 
 _LOG = logging.getLogger(__name__)
 
-TRACES_DIR   = os.path.expanduser("~/.keytap/traces")
+TRACES_DIR   = str(_TRACES_DIR)
 DEVICE_TRACE = "/data/misc/perfetto-traces/keytap.perfetto-trace"
 SESSION_KEY  = "keytap"
 

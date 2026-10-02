@@ -18,6 +18,7 @@ from capture_scrcpy import ScrcpyCaptureManager
 from config import ARGS, CURSOR_MODE, CURSOR_JUMP, ADB_PATH
 from element_manager import ElementManager
 from grid import GridRenderer
+from paths import DEEPLINKS_FILE
 from recorder import ActionRecorder
 from replayer import ActionReplayer
 from settings import kb
@@ -94,6 +95,7 @@ class KeyTap:
         from timeline_recorder import TimelineRecorder
         self.timeline_recorder = TimelineRecorder()
         self._timeline_active  = False
+        self._rec_full         = True    # last recording: True = full dump, False = actions only
 
         # Video capture (records mirror stream to MP4 during recording)
         from video_recorder import VideoRecorder
@@ -397,7 +399,9 @@ class KeyTap:
             try:
                 msg = json.loads(line)
                 if msg.get("action") == "tap":
-                    actions.tap(msg["cx"], msg["cy"])
+                    self._tap(msg["cx"], msg["cy"])
+                elif msg.get("action") == "record":
+                    self._record_palette_change(msg)
                 else:
                     bounds = msg.get("hover")
                     if bounds:
@@ -410,6 +414,17 @@ class KeyTap:
                         self._hier_highlight = None
             except Exception:
                 print(f"[proc stderr] {line}", flush=True)
+
+    def _record_palette_change(self, msg):
+        """A permission or dev-option change made in the palette while recording."""
+        kind = msg.get("kind")
+        if kind == "permission":
+            self.recorder.record_permission(msg["pkg"], msg["permission"], msg["state"])
+        elif kind == "dev_option":
+            self.recorder.record_dev_option(msg["label"], msg["state"])
+        else:
+            return
+        self._after_action_recorded()
 
     def _read_clipboard(self):
         try:
@@ -457,7 +472,9 @@ class KeyTap:
             try:
                 msg = json.loads(line)
                 if msg.get("action") == "tap":
-                    actions.tap(msg["cx"], msg["cy"])
+                    self._tap(msg["cx"], msg["cy"])
+                elif msg.get("action") == "record":
+                    self._record_palette_change(msg)
                 else:
                     bounds = msg.get("hover")
                     if bounds:
@@ -488,7 +505,7 @@ class KeyTap:
             return
 
         if t == 'tap':
-            actions.tap(result['cx'], result['cy'], on_status=self._set_status)
+            self._tap(result['cx'], result['cy'])
 
         elif t == 'install-apk':
             path = result.get('path', '')
@@ -498,12 +515,14 @@ class KeyTap:
         elif t == 'input-text':
             text = result['text']
             self.recorder.record_input_text(text)
+            self._after_action_recorded()
             actions.input_text(text, on_status=self._set_status)
 
         elif t == 'clipboard':
             text = result.get('value', '')
             if text:
                 self.recorder.record_input_text(text)
+                self._after_action_recorded()
                 actions.input_text(text, on_status=self._set_status)
             else:
                 self._set_status("clipboard empty")
@@ -511,6 +530,7 @@ class KeyTap:
         elif t == 'deeplink':
             url = result.get('value', '')
             self.recorder.record_launch_deeplink(url)
+            self._after_action_recorded()
             actions.launch_deeplink(url, on_status=self._set_status)
             self._add_deeplink(url)
 
@@ -540,26 +560,29 @@ class KeyTap:
             self._set_status(f"inserted wait: {ms}ms")
 
         elif t == 'start-recording':
+            self._rec_full = bool(result.get('full', True))
             self.recorder.start()
-            self.net_recorder.start()
             self.elements.enter(ref_surf=self._raw_surf, headless=True)
-            self.timeline_recorder.start(serial=ARGS.serial)
-            self._timeline_active = True
-            self.video_recorder.start(self.capture.win_w, self.capture.win_h)
-            self._video_active = True
-            self._set_status("recording...  (double-shift -> Stop Recording to save)")
+            if self._rec_full:
+                self.net_recorder.start()
+                self.timeline_recorder.start(serial=ARGS.serial)
+                self._timeline_active = True
+                self.video_recorder.start(self.capture.win_w, self.capture.win_h)
+                self._video_active = True
+            kind = "full dump" if self._rec_full else "actions only"
+            self._set_status(f"recording ({kind})...  (double-shift -> Stop Recording to save)")
 
         elif t == 'stop-recording':
             self._timeline_active = False
             self._video_active    = False
             self.recorder.stop()
-            network_capture = self.net_recorder.stop()
-            video_src       = self.video_recorder.stop()
+            network_capture = self.net_recorder.stop() if self._rec_full else {}
+            video_src       = self.video_recorder.stop() if self._rec_full else None
             if self.elements._headless:
                 self.elements.exit()
-            timeline_events = self.timeline_recorder.stop(
+            timeline_events = (self.timeline_recorder.stop(
                 network_flows=network_capture.get("flows", [])
-            )
+            ) if self._rec_full else [])
             name = result.get('name', 'recording')
             try:
                 path = self.recorder.save(
@@ -632,10 +655,15 @@ class KeyTap:
         self._set_status(f"{action} {pkg}")
         if action == "launch":
             self.recorder.record_launch(pkg)
+            self._after_action_recorded()
             actions.launch(pkg, on_status=self._set_status)
         elif action == "force-stop":
+            self.recorder.record_force_stop(pkg)
+            self._after_action_recorded()
             actions.force_stop(pkg, on_status=self._set_status)
         elif action == "clear-data":
+            self.recorder.record_clear_data(pkg)
+            self._after_action_recorded()
             actions.clear_data(pkg, on_status=self._set_status)
         elif action == "uninstall":
             actions.uninstall(pkg, on_status=self._set_status)
@@ -677,7 +705,7 @@ class KeyTap:
 
     # ── Deeplink history ──────────────────────────────────────────────────────
 
-    _DEEPLINK_PATH = os.path.expanduser("~/.keytap_deeplinks.json")
+    _DEEPLINK_PATH = str(DEEPLINKS_FILE)
 
     def _load_deeplinks(self):
         try:
@@ -802,7 +830,7 @@ class KeyTap:
             blink_on = int(time.time() * 2) % 2 == 0
             rec_color = (220, 50, 50) if blink_on else (100, 30, 30)
             rec_surf = self._status_font.render(
-                f"[REC] {self.recorder.action_count}", True, rec_color
+                f"[REC{'' if self._rec_full else ' actions'}] {self.recorder.action_count}", True, rec_color
             )
             sep_surf = self._status_font.render("  |  ", True, (136, 136, 136))
             main_surf = self._status_font.render(self._status[:90], True, (136, 136, 136))

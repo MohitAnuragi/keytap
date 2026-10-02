@@ -1,7 +1,7 @@
 """
 Full HPROF dumps of the foreground app via `am dumpheap`. Unlike the Perfetto heap graph these keep
 primitive fields and string contents, so they feed the content-level screens (activity state,
-RecyclerView rows, bitmap sources, duplicate strings). Each dump is a .hprof in ~/.keytap/hprofs/
+RecyclerView rows, bitmap sources, duplicate strings). Each dump is a .hprof in <keytap folder>/data/hprofs/
 with a JSON sidecar. Dumps hold everything in app memory, including user data: keep them local.
 """
 
@@ -13,10 +13,11 @@ import time
 from typing import List, Optional
 
 from heap_dump import _meminfo
+from paths import HPROFS_DIR as _HPROFS_DIR
 from perf_trace import _adb, foreground_package
 from utils import adb_shell
 
-HPROFS_DIR  = os.path.expanduser("~/.keytap/hprofs")
+HPROFS_DIR  = str(_HPROFS_DIR)
 DEVICE_FILE = "/data/local/tmp/keytap.hprof"
 MAX_KEEP    = 5            # dumps are 100MB+ each
 _END_TAG    = 0x2C         # HEAP_DUMP_END: present only when the dump is complete

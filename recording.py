@@ -8,7 +8,9 @@ import time
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional
 
-RECORDINGS_DIR = os.path.expanduser("~/.keytap/recordings")
+from paths import RECORDINGS_DIR as _RECORDINGS_DIR
+
+RECORDINGS_DIR = str(_RECORDINGS_DIR)
 
 
 def _compact(d):
@@ -27,7 +29,7 @@ class ElementSelector:
 @dataclass
 class Action:
     t: int           # ms since recording start
-    type: str        # tap | element_tap | swipe | input_text | launch | launch_deeplink | keyevent
+    type: str        # tap | element_tap | swipe | input_text | launch | launch_deeplink | keyevent | wait | force_stop | clear_data | permission | dev_option
     # tap
     x: Optional[int] = None
     y: Optional[int] = None
@@ -43,13 +45,16 @@ class Action:
     duration: Optional[int] = None
     # input_text
     text: Optional[str] = None
-    # launch
+    # launch | force_stop | clear_data
     package: Optional[str] = None
     # launch_deeplink
     url: Optional[str] = None
-    # keyevent
+    # keyevent; label also names a dev_option
     keycode: Optional[int] = None
     label: Optional[str] = None
+    # permission (package + permission, or "*" for all) and dev_option: the state it was set to
+    permission: Optional[str] = None
+    state: Optional[str] = None
 
     def to_dict(self):
         d = asdict(self)
@@ -75,7 +80,7 @@ class Recording:
              video_src_path: Optional[str] = None) -> str:
         """
         Saves recording as a directory:
-          ~/.keytap/recordings/{name}_{ts}/
+          <keytap folder>/data/recordings/{name}_{ts}/
             actions.json
             network.json        (only if network_flows non-empty)
             timeline.json       (only if timeline non-empty)
@@ -189,12 +194,14 @@ class Recording:
                 url=a.get("url"),
                 keycode=a.get("keycode"),
                 label=a.get("label"),
+                permission=a.get("permission"),
+                state=a.get("state"),
             ))
         return actions
 
     @classmethod
     def list_all(cls) -> List[dict]:
-        """Return [{path, name, recorded_at, action_count, has_network}] sorted newest first."""
+        """Return [{path, name, recorded_at, action_count, has_network, has_timeline}] sorted newest first."""
         if not os.path.isdir(RECORDINGS_DIR):
             return []
         results = []
@@ -213,6 +220,7 @@ class Recording:
                         "recorded_at": d.get("recorded_at", ""),
                         "action_count": len(d.get("actions", [])),
                         "has_network": os.path.exists(os.path.join(full, "network.json")),
+                        "has_timeline": os.path.exists(os.path.join(full, "timeline.json")),
                     })
                 elif entry.endswith(".json"):
                     # legacy single-file recording
@@ -224,6 +232,7 @@ class Recording:
                         "recorded_at": d.get("recorded_at", ""),
                         "action_count": len(d.get("actions", [])),
                         "has_network": bool(d.get("network_flows")),
+                        "has_timeline": False,
                     })
             except Exception:
                 pass
@@ -256,4 +265,101 @@ def action_label(action: "Action") -> str:
         return f"keyevent: {action.label or action.keycode}"
     elif t == "wait":
         return f"wait: {action.duration}ms"
+    elif t == "permission":
+        what = "ALL" if action.permission == "*" else (action.permission or "?").split(".")[-1]
+        return f"permission: {what} -> {(action.state or '?').lower()}"
+    elif t == "dev_option":
+        return f"dev_option: {action.label} -> {action.state}"
+    elif t == "force_stop":
+        return f"force_stop: {(action.package or '').split('.')[-1]}"
+    elif t == "clear_data":
+        return f"clear_data: {(action.package or '').split('.')[-1]}"
     return t
+
+
+# ── actions.json validation (used after hand-editing in vim) ──────────────────
+
+_REQUIRED = {
+    "tap":             ("x", "y"),
+    "swipe":           ("x1", "y1", "x2", "y2"),
+    "input_text":      ("text",),
+    "launch":          ("package",),
+    "force_stop":      ("package",),
+    "clear_data":      ("package",),
+    "launch_deeplink": ("url",),
+    "keyevent":        ("keycode",),
+    "wait":            ("duration",),
+    "element_tap":     ("selector",),
+    "permission":      ("package", "permission", "state"),
+    "dev_option":      ("label", "state"),
+}
+_SELECTOR_KEYS = {"resource_id", "content_desc", "text", "class_name"}
+
+
+def check_actions_file(path: str) -> List[str]:
+    """Problems that would break loading or replaying this actions.json. Empty list = valid."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        return [f"not valid JSON: {e.msg} (line {e.lineno}, column {e.colno})"]
+    except OSError as e:
+        return [f"cannot read file: {e}"]
+    if not isinstance(data, dict):
+        return ["top level must be a JSON object"]
+    problems = []
+    for key in ("name", "recorded_at"):
+        if key not in data:
+            problems.append(f'missing "{key}"')
+    acts = data.get("actions")
+    if not isinstance(acts, list):
+        return problems + ['"actions" must be a list']
+    prev_t = 0
+    for i, a in enumerate(acts, 1):
+        where = f"action {i}"
+        if not isinstance(a, dict):
+            problems.append(f"{where}: must be an object")
+            continue
+        t, typ = a.get("t"), a.get("type")
+        if not isinstance(t, int) or isinstance(t, bool) or t < 0:
+            problems.append(f'{where}: "t" must be a whole number of milliseconds')
+        elif t < prev_t:
+            problems.append(f'{where}: "t" ({t}) is earlier than the previous action ({prev_t})')
+        else:
+            prev_t = t
+        if typ not in _REQUIRED:
+            problems.append(f'{where}: unknown type "{typ}" (use one of: {", ".join(sorted(_REQUIRED))})')
+            continue
+        for field_name in _REQUIRED[typ]:
+            if a.get(field_name) in (None, ""):
+                problems.append(f'{where} ({typ}): needs "{field_name}"')
+        if typ == "permission" and a.get("state") not in (None, "GRANTED", "DENIED"):
+            problems.append(f'{where} (permission): "state" must be "GRANTED" or "DENIED"')
+        if typ == "element_tap" and isinstance(a.get("selector"), dict):
+            sel = a["selector"]
+            extra = set(sel) - _SELECTOR_KEYS
+            if extra:
+                problems.append(f'{where}: unknown selector keys {sorted(extra)} (allowed: {sorted(_SELECTOR_KEYS)})')
+            fb = a.get("fallback_coords")
+            has_fallback = isinstance(fb, list) and len(fb) == 2
+            if not (sel.get("resource_id") or sel.get("content_desc") or sel.get("text")) and not has_fallback:
+                problems.append(f"{where}: selector needs resource_id, content_desc or text "
+                                f'(or "fallback_coords": [x, y] to tap by position)')
+        elif typ == "element_tap" and a.get("selector") is not None:
+            problems.append(f'{where}: "selector" must be an object')
+    return problems
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) == 3 and sys.argv[1] == "--check":
+        issues = check_actions_file(sys.argv[2])
+        if issues:
+            print(f"actions.json has {len(issues)} problem(s):")
+            for line in issues:
+                print("  - " + line)
+            sys.exit(1)
+        print("actions.json is valid.")
+    else:
+        print("usage: python recording.py --check <actions.json>")
+        sys.exit(2)

@@ -144,6 +144,14 @@ class ActionReplayer:
             actions.launch_deeplink(action.url)
         elif t == "keyevent":
             actions.keyevent(action.keycode, action.label or "")
+        elif t == "permission":
+            actions.set_permission(action.package, action.permission, action.state)
+        elif t == "dev_option":
+            actions.set_dev_option(action.label, action.state)
+        elif t == "force_stop":
+            actions.force_stop(action.package)
+        elif t == "clear_data":
+            actions.clear_data(action.package)
         elif t == "wait":
             ms = action.duration or 0
             if ms > 0:

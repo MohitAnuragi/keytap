@@ -1,9 +1,9 @@
 """
-User settings + keybindings loaded from ~/.keytap/settings.json.
+User settings + keybindings loaded from <keytap folder>/data/settings.json.
 
 Edit that file to override any default. Missing keys fall back to defaults.
 
-Example ~/.keytap/settings.json:
+Example data/settings.json:
 {
     "keybindings": {
         "back": "b",
@@ -56,8 +56,7 @@ _DEFAULTS = {
 
 # ── Settings file path ───────────────────────────────────────────────────────
 
-SETTINGS_DIR  = Path.home() / ".keytap"
-SETTINGS_FILE = SETTINGS_DIR / "settings.json"
+from paths import DATA_DIR as SETTINGS_DIR, SETTINGS_FILE
 
 
 def _deep_merge(base, override):

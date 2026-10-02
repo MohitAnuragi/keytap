@@ -27,6 +27,7 @@ import numpy as np
 from av.video.reformatter import Interpolation
 
 from config import ARGS, ADB_PATH
+from paths import SCRCPY_DIR
 from settings import section as _s
 
 
@@ -34,7 +35,7 @@ SCRCPY_VERSION     = "4.1"
 SCRCPY_PORT        = 27183
 SCRCPY_DEVICE_PATH = "/data/local/tmp/scrcpy-server.jar"
 
-_CACHE_DIR    = Path.home() / ".keytap" / "scrcpy"
+_CACHE_DIR    = SCRCPY_DIR
 _LOCAL_JAR    = _CACHE_DIR / f"scrcpy-server-v{SCRCPY_VERSION}.jar"
 _DOWNLOAD_URL = (
     f"https://github.com/Genymobile/scrcpy/releases/download/"

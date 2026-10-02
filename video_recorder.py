@@ -19,6 +19,8 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Optional
 
+from paths import TMP_VIDEO
+
 try:
     import av
     import numpy as np
@@ -26,7 +28,7 @@ try:
 except ImportError:
     _AV_OK = False
 
-_TMP_PATH = str(Path.home() / ".keytap" / "tmp_screen.mp4")
+_TMP_PATH = str(TMP_VIDEO)
 
 
 class VideoRecorder:

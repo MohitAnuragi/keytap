@@ -1,8 +1,10 @@
 import json
 import os
 
+from paths import THEME_FILE
+
 _THEMES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "themes")
-_CONFIG_PATH = os.path.expanduser("~/.keytap.json")
+_CONFIG_PATH = str(THEME_FILE)
 _DEFAULT = "dracula"
 
 # Fallback values (current dark theme)

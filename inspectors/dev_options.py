@@ -244,6 +244,19 @@ def fetch(serial=None):
     return items
 
 
+def set_by_label(label, state, serial=None):
+    """Set option to an exact state: ON/OFF for toggles, or a value like 1.3x for cycles."""
+    opt = _BY_LABEL.get(label)
+    if not opt:
+        return False
+    if opt.get("type", "toggle") == "cycle":
+        adb_shell(opt["cmd_tpl"].format(state.rstrip("x")), serial)
+    else:
+        for cmd in (opt["enable_cmds"] if state == "ON" else opt["disable_cmds"]):
+            adb_shell(cmd, serial)
+    return True
+
+
 def toggle_by_label(label, serial=None):
     """Toggle or cycle option by label. Returns new state string."""
     opt = _BY_LABEL.get(label)

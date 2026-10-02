@@ -88,6 +88,25 @@ class ActionRecorder:
         if self.active:
             self._actions.append(Action(t=self._ms(), type="launch_deeplink", url=url))
 
+    def record_force_stop(self, package: str):
+        if self.active:
+            self._actions.append(Action(t=self._ms(), type="force_stop", package=package))
+
+    def record_clear_data(self, package: str):
+        if self.active:
+            self._actions.append(Action(t=self._ms(), type="clear_data", package=package))
+
+    def record_permission(self, package: str, permission: str, state: str):
+        """permission is a full permission name, or "*" for grant-all / deny-all; state GRANTED|DENIED."""
+        if self.active:
+            self._actions.append(Action(t=self._ms(), type="permission",
+                                        package=package, permission=permission, state=state))
+
+    def record_dev_option(self, label: str, state: str):
+        """state is the value the option was set to (ON, OFF, or e.g. 1.3x for Font Scale)."""
+        if self.active:
+            self._actions.append(Action(t=self._ms(), type="dev_option", label=label, state=state))
+
     def record_keyevent(self, keycode: int, label: str = ""):
         if self.active:
             self._actions.append(Action(

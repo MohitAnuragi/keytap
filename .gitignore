@@ -17,3 +17,6 @@ build/
 *.swp
 *.swo
 /tmp/keytap_stream.fifo
+
+# runtime data: recordings, traces, heap dumps, settings
+/data/

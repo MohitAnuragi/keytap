@@ -20,7 +20,7 @@ _LOGCAT_RE = re.compile(
 )
 
 # Sensible defaults — crashes, ANRs, jank only. No network tags (too noisy).
-# Add "OkHttp:D" / "Retrofit:D" via ~/.keytap/logcat_tags.txt for network logs.
+# Add "OkHttp:D" / "Retrofit:D" to DEFAULT_TAGS below for network logs.
 DEFAULT_TAGS = [
     "AndroidRuntime:E",   # crashes / uncaught exceptions
     "ActivityManager:W",  # activity lifecycle warnings, ANRs

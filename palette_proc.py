@@ -31,6 +31,8 @@ import json
 import logging
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -38,7 +40,9 @@ import time
 import tkinter as tk
 import tkinter.filedialog as filedialog
 
-_LOG_FILE = os.path.expanduser("~/.keytap_debug.log")
+from paths import LOG_FILE
+
+_LOG_FILE = str(LOG_FILE)
 _log = logging.getLogger("keytap.palette")
 
 # ── Feature flags ─────────────────────────────────────────────────────────────
@@ -827,6 +831,11 @@ class PaletteWindow:
             return self._viewer_shown_idx[lb_idx]
         return lb_idx  # fallback (unfiltered)
 
+    def _record_event(self, **event):
+        """Tell the app to record a device change made here. Only while a recording is running."""
+        if self.data.get("recording_active"):
+            print(json.dumps({"action": "record", **event}), file=sys.stderr, flush=True)
+
     def _toggle_dev_option(self, lb_idx):
         raw_idx = self._resolve_raw_idx(lb_idx)
         if raw_idx >= len(self._viewer_raw_items):
@@ -843,6 +852,8 @@ class PaletteWindow:
                 new_state = _m.toggle_by_label(label, serial)
             except Exception as e:
                 new_state = f"err: {e}"
+            if new_state not in ("?",) and not new_state.startswith("err"):
+                self._record_event(kind="dev_option", label=label, state=new_state)
             self._viewer_raw_items[raw_idx] = (label, new_state)
             display = f"  {label}  [{new_state}]"
             self._viewer_all[raw_idx] = display
@@ -864,6 +875,8 @@ class PaletteWindow:
             try:
                 from inspectors import permissions as _m
                 _m.set_all(pkg, grant)
+                self._record_event(kind="permission", pkg=pkg, permission="*",
+                                   state="GRANTED" if grant else "DENIED")
                 items = _m.fetch(pkg)
             except Exception as e:
                 items = [("error", str(e))]
@@ -892,6 +905,8 @@ class PaletteWindow:
                 new_state = _m.toggle(perm, pkg, serial)
             except Exception as e:
                 new_state = f"err: {e}"
+            if new_state in ("GRANTED", "DENIED"):
+                self._record_event(kind="permission", pkg=pkg, permission=perm, state=new_state)
             self._viewer_raw_items[raw_idx] = (perm, new_state)
             display = f"  {perm}  =  {new_state}"
             self._viewer_all[raw_idx] = display
@@ -902,12 +917,17 @@ class PaletteWindow:
 
     def _enter_recorder(self):
         items = [
-            ("  Record          – start a new recording", "record"),
             ("  Replay          – run a saved recording", "replay"),
-            ("  Manage          – delete / view recordings", "manage"),
+            ("  Manage          – edit / delete / view recordings", "manage"),
+            ("  Timeline Viewer – actions, logcat and network on one timeline", "timeline"),
         ]
         if self.data.get("recording_active"):
             items.insert(0, ("  [Insert Wait]   – add a timed pause to recording", "insert-wait"))
+        else:
+            items = [
+                ("  Record - actions only   – taps, swipes, text, launches", "record-actions"),
+                ("  Record - full dump      – actions + network + timeline + video", "record-full"),
+            ] + items
         self._viewer_raw_items = [t for _, t in items]
         self._viewer_all       = [l for l, _ in items]
         self._viewer_shown_idx = list(range(len(items)))
@@ -927,12 +947,14 @@ class PaletteWindow:
         if raw_idx >= len(self._viewer_raw_items):
             return
         action = self._viewer_raw_items[raw_idx]
-        if action == "record":
-            self._emit({"type": "start-recording"})
+        if action in ("record-actions", "record-full"):
+            self._emit({"type": "start-recording", "full": action == "record-full"})
         elif action == "replay":
             self._enter_recorder_replay()
         elif action == "manage":
             self._enter_recorder_manage()
+        elif action == "timeline":
+            self._open_timeline_viewer()
         elif action == "insert-wait":
             self._enter_recorder_insert_wait()
 
@@ -1032,7 +1054,8 @@ class PaletteWindow:
         else:
             self._viewer_raw_items = recordings
             self._viewer_all = [
-                f"  {r['name']}  –  {r['recorded_at'][:16]}  ({r['action_count']} steps)"
+                f"  {r['name']}  –  {r['recorded_at'][:16]}  ({r['action_count']} steps"
+                f"{', timeline' if r.get('has_timeline') else ''})"
                 for r in recordings
             ]
             self._viewer_shown_idx = list(range(len(recordings)))
@@ -1057,6 +1080,8 @@ class PaletteWindow:
         self._manage_recording = self._viewer_raw_items[raw_idx]
         sub = [
             ("  View Actions  – preview all steps in this recording", "view-actions"),
+            ("  Edit Actions  – open actions.json in vim (new Terminal window)", "edit"),
+            ("  Timeline      – open this recording in the Timeline Viewer", "timeline"),
             ("  Delete        – permanently remove this recording",   "delete"),
         ]
         self._viewer_raw_items = [a for _, a in sub]
@@ -1089,6 +1114,54 @@ class PaletteWindow:
             self._enter_recorder_manage()
         elif action == "view-actions":
             self._show_recording_actions(rec)
+        elif action == "edit":
+            self._edit_recording(rec)
+        elif action == "timeline":
+            if rec.get("has_timeline"):
+                self._open_timeline_viewer(rec["path"])
+            else:
+                self._footer.config(text="no timeline for this recording (it was recorded as actions only)")
+
+    def _open_timeline_viewer(self, path=None):
+        """Launch timeline_viewer.py as its own window/process. With no path it asks for a recording."""
+        viewer = os.path.join(os.path.dirname(os.path.abspath(__file__)), "timeline_viewer.py")
+        try:
+            with open(LOG_FILE, "ab") as log:
+                subprocess.Popen([sys.executable, viewer] + ([path] if path else []),
+                                 stdout=log, stderr=log, start_new_session=True)
+            self._footer.config(text="opened the Timeline Viewer in a new window  |  Esc=back")
+        except Exception as e:
+            self._footer.config(text=f"could not open the Timeline Viewer: {str(e)[:70]}")
+
+    def _edit_recording(self, rec):
+        """Open actions.json in vim in a new Terminal window. A backup is kept as actions.json.bak,
+        and the file is validated when vim closes so a typo shows up now, not mid-replay."""
+        path = rec["path"]
+        target = os.path.join(path, "actions.json") if os.path.isdir(path) else path
+        if sys.platform != "darwin":
+            self._footer.config(text=f"edit manually: {target}")
+            return
+        try:
+            shutil.copy2(target, target + ".bak")
+            checker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recording.py")
+            script = (
+                f'F={shlex.quote(target)}; '
+                'if command -v vim >/dev/null 2>&1; then vim "$F"; else vi "$F"; fi; echo; '
+                f'{shlex.quote(sys.executable)} {shlex.quote(checker)} --check "$F"; echo; '
+                'echo "Backup of the version before this edit: $F.bak"; echo; '
+                'read -n 1 -s -r -p "Press any key to close this window..."'
+            )
+            cmd = f"/bin/bash -c {shlex.quote(script)}; exit"
+            escaped = cmd.replace("\\", "\\\\").replace('"', '\\"')
+            subprocess.Popen(["osascript",
+                              "-e", 'tell application "Terminal"',
+                              "-e", "activate",
+                              "-e", f'do script "{escaped}"',
+                              "-e", "end tell"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._footer.config(text="opened in Terminal (vim)  |  save with :wq  |  Esc=back")
+        except Exception as e:
+            self._footer.config(text=f"could not open editor: {str(e)[:80]}")
 
     def _show_recording_actions(self, rec):
         try:

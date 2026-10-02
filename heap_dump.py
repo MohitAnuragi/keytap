@@ -1,6 +1,6 @@
 """
 Java heap snapshots of the foreground app via Perfetto's java_hprof data source.
-Each snapshot is a .pftrace in ~/.keytap/heaps/ with a JSON sidecar. The app
+Each snapshot is a .pftrace in <keytap folder>/data/heaps/ with a JSON sidecar. The app
 freezes for a few seconds while the heap is dumped.
 """
 
@@ -11,12 +11,13 @@ import re
 import time
 from typing import List, Optional
 
+from paths import HEAPS_DIR as _HEAPS_DIR
 from perf_trace import _adb, foreground_package
 from utils import adb_shell
 
 _LOG = logging.getLogger(__name__)
 
-HEAPS_DIR   = os.path.expanduser("~/.keytap/heaps")
+HEAPS_DIR   = str(_HEAPS_DIR)
 DEVICE_FILE = "/data/misc/perfetto-traces/keytap_heap.pftrace"
 DUMP_MS     = 10_000
 MAX_KEEP    = 10          # snapshots are tens of MB each

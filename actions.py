@@ -93,6 +93,32 @@ def clear_data(pkg, on_status=None):
     _run(lambda: adb("shell", "pm", "clear", pkg))
 
 
+def set_permission(pkg, permission, state, on_status=None):
+    """Set one permission (or "*" for all) to GRANTED or DENIED. Idempotent, safe to replay."""
+    if on_status:
+        on_status(f"{state.lower()} {permission if permission != '*' else 'all permissions'} for {pkg}")
+
+    def _do():
+        if permission == "*":
+            from inspectors import permissions
+            permissions.set_all(pkg, state == "GRANTED")
+        else:
+            adb("shell", "pm", "grant" if state == "GRANTED" else "revoke", pkg, permission)
+    _run(_do)
+
+
+def set_dev_option(label, state, on_status=None):
+    """Set a Dev Options entry to the exact state it was recorded with."""
+    if on_status:
+        on_status(f"dev option {label} -> {state}")
+
+    def _do():
+        from config import ARGS
+        from inspectors import dev_options
+        dev_options.set_by_label(label, state, ARGS.serial)
+    _run(_do)
+
+
 def uninstall(pkg, on_status=None):
     if on_status:
         on_status(f"uninstall {pkg}")
