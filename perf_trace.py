@@ -19,6 +19,7 @@ _LOG = logging.getLogger(__name__)
 
 TRACES_DIR   = os.path.expanduser("~/.keytap/traces")
 DEVICE_TRACE = "/data/misc/perfetto-traces/keytap.perfetto-trace"
+SESSION_KEY  = "keytap"
 
 # Safety net: perfetto ends the session itself if keytap dies before stop().
 MAX_DURATION_MS = 180_000
@@ -50,6 +51,8 @@ def build_config(preset: str, package: Optional[str]) -> str:
     cats   = "\n".join(f'    atrace_categories: "{c}"' for c in _ATRACE_CATEGORIES)
     return f"""buffers {{ size_kb: {p["buffer_kb"]} fill_policy: DISCARD }}
 duration_ms: {MAX_DURATION_MS}
+write_into_file: true
+file_write_period_ms: 2000
 data_sources {{ config {{ name: "android.surfaceflinger.frametimeline" }} }}
 data_sources {{ config {{ name: "linux.process_stats" process_stats_config {{ scan_all_processes_on_start: true }} }} }}
 data_sources {{ config {{ name: "linux.ftrace" ftrace_config {{
@@ -90,7 +93,6 @@ class PerfettoCapture:
 
     def __init__(self):
         self.active = False
-        self._pid = None
         self._serial = None
         self._meta = {}
         self._start_t = 0.0
@@ -108,14 +110,12 @@ class PerfettoCapture:
             debuggable = "DEBUGGABLE" in flags
 
         res = _adb(serial, "shell", "perfetto", "-c", "-", "--txt",
-                   "-o", DEVICE_TRACE, "--background",
+                   "-o", DEVICE_TRACE, f"--detach={SESSION_KEY}",
                    input=build_config(preset, package).encode())
-        m = re.search(r'\d+', res.stdout.decode(errors="replace"))
-        if res.returncode != 0 or not m:
+        if res.returncode != 0:
             err = (res.stderr or res.stdout).decode(errors="replace").strip()
-            raise RuntimeError(f"perfetto failed to start: {err[:120] or 'no pid returned'}")
+            raise RuntimeError(f"perfetto failed to start: {err[:120] or 'unknown error'}")
 
-        self._pid    = m.group(0)
         self._serial = serial
         self._start_t = time.time()
         self._meta = {
@@ -128,7 +128,7 @@ class PerfettoCapture:
             "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
         self.active = True
-        _LOG.debug("perfetto started pid=%s preset=%s pkg=%s", self._pid, preset, package)
+        _LOG.debug("perfetto started preset=%s pkg=%s", preset, package)
 
     def stop(self) -> str:
         """Stop tracing, pull the file. Returns local path. Raises RuntimeError on failure."""
@@ -136,11 +136,12 @@ class PerfettoCapture:
             raise RuntimeError("no trace running")
         self.active = False
         serial = self._serial
-        _adb(serial, "shell", "kill", "-TERM", self._pid)
-        for _ in range(30):   # wait up to 15s for perfetto to flush and exit
-            if _adb(serial, "shell", "kill", "-0", self._pid).returncode != 0:
-                break
-            time.sleep(0.5)
+        # adb shell cannot kill perfetto on some devices (Permission denied), so stop via attach.
+        # Blocks until the trace is flushed to the output file.
+        res = _adb(serial, "shell", "perfetto", f"--attach={SESSION_KEY}", "--stop", timeout=60)
+        if res.returncode != 0:
+            err = (res.stderr or res.stdout).decode(errors="replace").strip()
+            raise RuntimeError(f"perfetto stop failed: {err[-120:]}")
 
         os.makedirs(TRACES_DIR, exist_ok=True)
         base = os.path.join(TRACES_DIR, f"{time.strftime('%Y%m%d_%H%M%S')}_{self._meta['preset']}")
