@@ -30,3 +30,14 @@ def toggle(perm, pkg, serial=None):
             return "GRANTED"
     except Exception as e:
         return f"err: {e}"
+
+
+def set_all(pkg, grant):
+    """Grant or revoke every permission; skips ones pm refuses (non-runtime)."""
+    for perm, state in fetch(pkg):
+        if perm == "error" or (state == "GRANTED") == grant:
+            continue
+        try:
+            adb("shell", "pm", "grant" if grant else "revoke", pkg, perm)
+        except Exception:
+            pass

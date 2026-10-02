@@ -714,9 +714,14 @@ class PaletteWindow:
             raw_items, label, interactive = [("error", str(e))], fetch_type, False
         # Format tuples as display strings
         bracket = fetch_type == "dev-options"
+        if fetch_type == "permissions" and interactive:
+            raw_items = [(self._GRANT_ALL, ""), (self._DENY_ALL, "")] + list(raw_items)
         items = []
         for it in raw_items:
             if isinstance(it, (list, tuple)) and len(it) == 2:
+                if it[1] == "":
+                    items.append(f"  {it[0]}")
+                    continue
                 sep = f"  [{it[1]}]" if bracket else f"  =  {it[1]}"
                 items.append(f"  {it[0]}{sep}")
             else:
@@ -791,11 +796,32 @@ class PaletteWindow:
         self._lb.selection_set(lb_idx)
         self._lb.activate(lb_idx)
 
+    _GRANT_ALL = "[ GRANT ALL ]"
+    _DENY_ALL  = "[ DENY ALL ]"
+
+    def _bulk_permissions(self, pkg, grant):
+        self._footer.config(text="Granting all..." if grant else "Denying all...")
+        def _do():
+            try:
+                from inspectors import permissions as _m
+                _m.set_all(pkg, grant)
+                items = _m.fetch(pkg)
+            except Exception as e:
+                items = [("error", str(e))]
+            raw = [(self._GRANT_ALL, ""), (self._DENY_ALL, "")] + items
+            lines = [f"  {p}" if st == "" else f"  {p}  =  {st}" for p, st in raw]
+            self.root.after(0, lambda: self._show_viewer_items(
+                f"Permissions – {pkg}", lines, raw, True))
+        threading.Thread(target=_do, daemon=True).start()
+
     def _toggle_permission(self, lb_idx, pkg):
         raw_idx = self._resolve_raw_idx(lb_idx)
         if raw_idx >= len(self._viewer_raw_items):
             return
         perm, _ = self._viewer_raw_items[raw_idx]
+        if perm in (self._GRANT_ALL, self._DENY_ALL):
+            self._bulk_permissions(pkg, perm == self._GRANT_ALL)
+            return
         self._lb.delete(lb_idx)
         self._lb.insert(lb_idx, f"  {perm}  =  ...")
         self._lb.selection_set(lb_idx)
