@@ -177,6 +177,67 @@ class Hprof:
         return None
 
 
+    # ── reference graph ───────────────────────────────────────────────────────
+
+    def build_graph(self):
+        """Dense node ids (sorted object ids) plus forward and reverse edge lists, built with numpy.
+        After this: self.ids, self.src/self.dst (node indexes), self.rev_start/self.rev_src (CSR by dst)."""
+        import numpy as np
+        S = self.idsz
+        buf = np.frombuffer(self.m, dtype=np.uint8)
+        ids = np.array(sorted(set(self.inst_by_id) | set(self.obj_arrays) | set(self.prim_arrays)
+                              | set(self.classes)), dtype=np.int64)
+        srcs, dsts = [], []
+
+        def rd(offs):   # big-endian id at each absolute offset
+            v = np.zeros(len(offs), np.int64)
+            for k in range(S):
+                v = (v << 8) | buf[offs + k].astype(np.int64)
+            return v
+
+        for cid, lst in self.instances.items():
+            deltas, d = [], 0
+            for _, t in self.flat_fields(cid):
+                if t == OBJECT:
+                    deltas.append(d)
+                d += self.idsz if t == OBJECT else _SIZE[t]
+            if not deltas:
+                continue
+            oids = np.fromiter((o for o, _, _ in lst), np.int64, len(lst))
+            base = np.fromiter((off for _, off, _ in lst), np.int64, len(lst))
+            for dl in deltas:
+                srcs.append(oids)
+                dsts.append(rd(base + dl))
+        for oid, (_, n, off) in self.obj_arrays.items():
+            if n:
+                elems = np.frombuffer(self.m, dtype=">u4" if S == 4 else ">u8", count=n, offset=off).astype(np.int64)
+                srcs.append(np.full(n, oid, np.int64))
+                dsts.append(elems)
+        for cid, c in self.classes.items():                 # static fields hold references too
+            for nid, t, p in c["statics"]:
+                if t == OBJECT:
+                    srcs.append(np.array([cid], np.int64))
+                    dsts.append(np.array([self._rid(p)], np.int64))
+        src, dst = np.concatenate(srcs), np.concatenate(dsts)
+        keep = dst != 0
+        src, dst = src[keep], dst[keep]
+        si, di = np.searchsorted(ids, src), np.searchsorted(ids, dst)
+        ok = (di < len(ids)) & (ids[np.minimum(di, len(ids) - 1)] == dst) & (ids[np.minimum(si, len(ids) - 1)] == src)
+        self.ids, self.src, self.dst = ids, si[ok].astype(np.int32), di[ok].astype(np.int32)
+        order = np.argsort(self.dst, kind="stable")
+        self.rev_src = self.src[order]
+        self.rev_start = np.searchsorted(self.dst[order], np.arange(len(ids) + 1))
+        return self
+
+    def node(self, oid):
+        import numpy as np
+        i = int(np.searchsorted(self.ids, oid))
+        return i if i < len(self.ids) and self.ids[i] == oid else None
+
+    def referrers(self, idx):
+        return self.rev_src[self.rev_start[idx]:self.rev_start[idx + 1]]
+
+
 def main(path):
     t = time.time()
     h = Hprof(path).parse()

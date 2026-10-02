@@ -79,8 +79,21 @@ def _trim():
                 pass
 
 
-def capture(serial: Optional[str], label: str = "") -> str:
-    """Dump the foreground app's Java heap. Returns local path. Raises RuntimeError."""
+def capture(serial: Optional[str], label: str = "", progress=None) -> str:
+    """Dump the foreground app's Java heap. Returns local path. Raises RuntimeError.
+    progress(msg) is called with a short status as the dump moves through its stages."""
+    try:
+        return _capture(serial, label, progress)
+    finally:
+        try:   # also when the dump failed or timed out, so nothing is left on the device
+            _adb(serial, "shell", "rm", "-f", DEVICE_FILE)
+        except Exception:
+            pass
+
+
+def _capture(serial: Optional[str], label: str = "", progress=None) -> str:
+    progress = progress or (lambda _msg: None)
+    progress("finding the foreground app...")
     package = foreground_package(serial)
     if not package:
         raise RuntimeError("no foreground app found")
@@ -90,6 +103,7 @@ def capture(serial: Optional[str], label: str = "") -> str:
     started = time.strftime("%Y-%m-%dT%H:%M:%S")
     meminfo = _meminfo(serial, package)
 
+    progress(f"recording the heap of {package} (about {DUMP_MS // 1000} seconds)...")
     res = _adb(serial, "shell", "perfetto", "-c", "-", "--txt", "-o", DEVICE_FILE,
                input=_config(pids[0]).encode(), timeout=DUMP_MS // 1000 + 60)
     if res.returncode != 0:
@@ -100,6 +114,7 @@ def capture(serial: Optional[str], label: str = "") -> str:
     slug = re.sub(r"[^\w-]+", "_", label).strip("_")[:30]
     base = os.path.join(HEAPS_DIR, time.strftime("%Y%m%d_%H%M%S") + (f"_{slug}" if slug else ""))
     path = base + ".pftrace"
+    progress("copying the snapshot to this Mac...")
     res = _adb(serial, "pull", DEVICE_FILE, path, timeout=300)
     _adb(serial, "shell", "rm", "-f", DEVICE_FILE)
     if res.returncode != 0 or not os.path.isfile(path):

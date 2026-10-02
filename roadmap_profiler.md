@@ -37,6 +37,10 @@ Palette flow:
 
 Cmd+I on an instance shows what that object keeps alive: its fields with the size only it keeps alive (shared fields marked), plus everything it exclusively retains grouped by class. Enter on a field drills into the child, Esc goes back one level. Backed by a per-snapshot numpy index (`<snapshot>.graph.npz`, built once in about 6s); recursive SQL over the dominator tree was far too slow (18s for 1,193 objects), so subtrees are walked in Python.
 
+### Detail Snapshot (shipped, POC-grade)
+
+Full HPROF via `am dumpheap` (`hprof_dump.py`), read by our own parser (`hprof_parser.py`) and analysed in a subprocess (`hprof_analysis.py`, about 5s, cached as `<dump>.detail.json`). It keeps primitives and string contents that the Perfetto dump drops. Screens: Activities (destroyed or finished but alive), RecyclerViews (id, size, adapter, live rows and their text, cached and pooled holders), Bitmaps (Glide source URL, hosting view size, pixel ratio, OVERSIZED flag), Duplicate strings with values. Both snapshot kinds run inside the palette with a live progress screen. Known limits: URL lookup is a heuristic on Glide request objects (21 of 128 bitmaps on the test build), adapters stay obfuscated without a mapping file, resource ids show as hex, the analysis peaks around 1.6GB for a 112MB dump, and dumps contain user data so they stay local (5 kept in `~/.keytap/hprofs/`). Retained sizes and reference paths still come from the Perfetto snapshot.
+
 ### Cheaper layers
 
 - `dumpsys meminfo <pkg>` readout: instant, no trace file. Java, native, graphics and code split, plus Activity and View counts. Good first screen before the heavy dump.

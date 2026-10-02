@@ -26,10 +26,12 @@ Output JSON:
   {"type": "clipboard"}
   {"type": "deeplink",      "value": str}
 """
+import collections
 import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -164,6 +166,13 @@ class PaletteWindow:
         self._heap_sort    = "retained"  # retained | shallow | cnt
         self._heap_own     = True        # only classes under the app's package prefix
         self._viewer_search = None       # (on_enter, fn(query)): viewer-specific search
+
+        self._dump = None                # running snapshot capture, see _start_dump
+
+        # detail snapshot (HPROF) state
+        self._hp_meta = None
+        self._hp_data = None
+        self._hp_bitmap_sort = "size"    # size | ratio
 
         # actions state
         self._action_items       = []   # set by _enter_actions; init here avoids trace race
@@ -414,7 +423,9 @@ class PaletteWindow:
         elif self.state == "input":
             text = self._var.get().strip()
             if self._input_context == "heap-label":
-                self._emit({"type": "heap-snapshot", "label": text})
+                self._start_dump("heap", text)
+            elif self._input_context == "hprof-label":
+                self._start_dump("hprof", text)
             elif text:
                 if self._input_context == "stop-recording":
                     self._emit({"type": "stop-recording", "name": text})
@@ -483,6 +494,9 @@ class PaletteWindow:
         if self.state == "viewer" and self._viewer_on_enter == self._on_trace_frame:
             self._trace_sort = "time" if self._trace_sort == "dur" else "dur"
             self._show_trace_frames()
+        elif self.state == "viewer" and self._viewer_on_enter == self._on_hprof_bitmap:
+            self._hp_bitmap_sort = "ratio" if self._hp_bitmap_sort == "size" else "size"
+            self._show_hprof_bitmaps()
         elif self.state == "viewer" and self._viewer_on_enter == self._on_heap_class:
             order = ("retained", "shallow", "cnt")
             self._heap_sort = order[(order.index(self._heap_sort) + 1) % len(order)]
@@ -1325,6 +1339,8 @@ class PaletteWindow:
         rows = [
             ("  Heap Snapshot   – dump the foreground app's Java heap", "snapshot"),
             ("  Snapshots       – top classes, reference paths, diff", "list"),
+            ("  Detail Snapshot – activities, RecyclerViews, bitmaps, strings", "hprof"),
+            ("  Detail Snapshots – open a saved detail dump", "hprof-list"),
         ]
         self._set_trace_viewer("Memory Profiler", rows, "Enter=select  Esc=back",
                                on_enter=self._on_memory_action)
@@ -1333,19 +1349,24 @@ class PaletteWindow:
         raw_idx = self._resolve_raw_idx(lb_idx)
         if raw_idx >= len(self._viewer_raw_items):
             return
-        if self._viewer_raw_items[raw_idx] == "snapshot":
+        action = self._viewer_raw_items[raw_idx]
+        if action == "snapshot":
             self._enter_heap_label()
+        elif action == "hprof":
+            self._enter_heap_label("hprof-label")
+        elif action == "hprof-list":
+            self._enter_hprof_list()
         else:
             self._enter_heap_list()
 
-    def _enter_heap_label(self):
+    def _enter_heap_label(self, context="heap-label"):
         self.state = "input"
-        self._input_context = "heap-label"
+        self._input_context = context
         self._var.set("")
         self._prompt.config(text="snapshot label (optional) >")
         self._lb.delete(0, "end")
         self._lb.insert("end", "  e.g. after opening Orders, before back")
-        self._lb.insert("end", "  The app freezes for a few seconds while the heap is dumped")
+        self._lb.insert("end", "  The app freezes while the heap is dumped (a few seconds, longer for big heaps)")
         self._lb.selection_set(0)   # _on_enter ignores Enter when nothing is selected
         self._footer.config(text="Enter=dump  Esc=cancel")
 
@@ -1706,6 +1727,295 @@ class PaletteWindow:
             return
         self._open_heap_path(b, f"Bitmap #{b['id']}  {b['w']}x{b['h']}  {self._fmt_bytes(b['size'])}",
                              self._show_heap_bitmaps)
+
+    # ── Snapshot capture with live progress ───────────────────────────────────
+
+    _SPINNER = "|/-\\"
+
+    def _start_dump(self, kind, label):
+        """Run a snapshot capture inside the palette so it can show progress, not close on Enter."""
+        d = {"kind": kind, "stage": "starting...", "t0": time.time(), "path": None, "err": None}
+        self._dump = d
+        self._set_trace_viewer(self._dump_title(d), [("  starting...", None)],
+                               "dump in progress, please wait", on_back=self._dump_back)
+
+        def _run():
+            try:
+                if kind == "heap":
+                    from heap_dump import capture
+                else:
+                    from hprof_dump import capture
+                d["path"] = capture(self._serial, label, lambda msg: d.__setitem__("stage", msg))
+            except Exception as e:
+                d["err"] = str(e) or type(e).__name__
+        threading.Thread(target=_run, daemon=True).start()
+        self._tick_dump(d)
+
+    @staticmethod
+    def _dump_title(d):
+        return "Heap Snapshot" if d["kind"] == "heap" else "Detail Snapshot"
+
+    def _dump_back(self):
+        if self._dump is not None:
+            self._footer.config(text="dump in progress, please wait (closing now would leave it unfinished)")
+        else:
+            self._enter_memory()
+
+    def _tick_dump(self, d):
+        if self._dump is not d:
+            return
+        if d["path"] or d["err"]:
+            self._finish_dump(d)
+            return
+        elapsed = int(time.time() - d["t0"])
+        spin = self._SPINNER[int(time.time() * 6) % len(self._SPINNER)]
+        lines = [f"  [{spin}]  {self._dump_title(d)}  -  {elapsed}s elapsed",
+                 f"        {d['stage']}",
+                 "",
+                 "  The app freezes while the heap is written. Keep this window open."]
+        self._fill_viewer(lines, [None] * len(lines))
+        self.root.after(150, lambda: self._tick_dump(d))
+
+    def _finish_dump(self, d):
+        self._dump = None
+        title = self._dump_title(d)
+        if d["err"]:
+            self._set_trace_viewer(title, [(f"  failed: {d['err'][:110]}", None)],
+                                   "Esc=back", on_back=self._enter_memory)
+            return
+        elapsed = int(time.time() - d["t0"])
+        rows = [(f"  Saved in {elapsed}s: {os.path.basename(d['path'])}", None),
+                ("", None),
+                ("  Open it now", d["kind"]),
+                ("  Back to Memory Profiler", "back")]
+        self._set_trace_viewer(title, rows, "Enter=select  Esc=back",
+                               on_enter=self._on_dump_done, on_back=self._enter_memory)
+
+    def _on_dump_done(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        action = self._viewer_raw_items[raw_idx]
+        try:
+            if action == "heap":
+                from heap_dump import list_snapshots
+                self._heap_snaps = list_snapshots()
+                self._open_heap(self._heap_snaps[0], None)
+            elif action == "hprof":
+                from hprof_dump import list_snapshots
+                self._open_hprof(list_snapshots()[0])
+            elif action == "back":
+                self._enter_memory()
+        except Exception as e:
+            self._set_trace_viewer("Snapshot", [(f"  error: {str(e)[:100]}", None)],
+                                   "Esc=back", on_back=self._enter_memory)
+
+    # ── Detail snapshots (full HPROF) ─────────────────────────────────────────
+
+    @staticmethod
+    def _hex_id(rid):
+        return f"0x{rid & 0xffffffff:08x}"
+
+    @staticmethod
+    def _chunks(text, n=100):
+        text = text.replace("\n", "\\n").replace("\r", "")
+        return [text[i:i + n] for i in range(0, len(text), n)] or [""]
+
+    def _enter_hprof_list(self):
+        self._hp_meta = None
+        try:
+            from hprof_dump import list_snapshots
+            snaps = list_snapshots()
+        except Exception:
+            snaps = []
+        if not snaps:
+            self._set_trace_viewer("Detail Snapshots", [("  No detail snapshots found", None)],
+                                   "Esc=back", on_back=self._enter_memory)
+            return
+        rows = [(f"  {s.get('started_at', '')[5:16]}  {s.get('size', 0) / (1 << 20):>5.0f}MB  "
+                 f"{s.get('package', '')}  {s.get('label', '')}", s) for s in snaps]
+        self._set_trace_viewer("Detail Snapshots", rows,
+                               f"{len(rows)} detail snapshots  |  Enter=open  Esc=back",
+                               on_enter=self._on_hprof_snapshot, on_back=self._enter_memory)
+
+    def _on_hprof_snapshot(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx < len(self._viewer_raw_items):
+            self._open_hprof(self._viewer_raw_items[raw_idx])
+
+    def _open_hprof(self, meta):
+        self._hp_meta, self._hp_data = meta, None
+        cache = meta["path"] + ".detail.json"
+        if os.path.isfile(cache) and os.path.getmtime(cache) >= os.path.getmtime(meta["path"]):
+            with open(cache) as f:
+                self._hp_data = json.load(f)
+            self._show_hprof_home()
+            return
+        self._set_trace_viewer("Detail Snapshot",
+                               [("  analyzing dump...  (about 5 seconds, then cached)", None)],
+                               "Esc=back", on_back=self._enter_hprof_list)
+        threading.Thread(target=self._bg_hprof, args=(meta,), daemon=True).start()
+
+    def _bg_hprof(self, meta):
+        data, err = None, None
+        try:
+            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hprof_analysis.py")
+            res = subprocess.run([sys.executable, script, meta["path"]], capture_output=True, timeout=600)
+            if res.returncode != 0:
+                err = res.stderr.decode(errors="replace").strip().splitlines()[-1][:90]
+            else:
+                with open(meta["path"] + ".detail.json") as f:
+                    data = json.load(f)
+        except Exception as e:
+            err = str(e)
+        self.root.after(0, lambda: self._on_hprof_ready(meta, data, err))
+
+    def _on_hprof_ready(self, meta, data, err):
+        if self._hp_meta is not meta:
+            return
+        if err:
+            self._set_trace_viewer("Detail Snapshot", [(f"  error: {err}", None)],
+                                   "Esc=back", on_back=self._enter_hprof_list)
+            return
+        self._hp_data = data
+        self._show_hprof_home()
+
+    def _show_hprof_home(self):
+        d, m = self._hp_data, self._hp_meta
+        acts = d["activities"]
+        stale = sum(1 for a in acts if a["destroyed"] or a["finished"])
+        rows_on_screen = sum(len(r["rows"]) for r in d["recyclers"])
+        bms = d["bitmaps"]
+        oversized = sum(1 for b in bms if b["ratio"] and b["ratio"] >= 1.5)
+        s = d["strings"]
+        rows = [
+            (f"  {m.get('package', '')}  {m.get('label', '')}  ({m.get('size', 0) / (1 << 20):.0f}MB dump)", None),
+            (f"  Activities        - {len(acts)} alive, {stale} destroyed or finished but still in memory", "activities"),
+            (f"  RecyclerViews     - {len(d['recyclers'])} lists, {rows_on_screen} rows alive", "recyclers"),
+            (f"  Bitmaps           - {len(bms)}, {sum(1 for b in bms if b['url'])} with source URL, "
+             f"{oversized} much larger than their view", "bitmaps"),
+            (f"  Duplicate strings - {s['dup_strings']} values, {s['extra_copies']} extra copies, "
+             f"{s['wasted_chars']:,} chars", "strings"),
+        ]
+        self._set_trace_viewer("Detail Snapshot", rows, "Enter=open  Esc=back",
+                               on_enter=self._on_hprof_home, on_back=self._enter_hprof_list)
+
+    def _on_hprof_home(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        {"activities": self._show_hprof_activities, "recyclers": self._show_hprof_recyclers,
+         "bitmaps": self._show_hprof_bitmaps, "strings": self._show_hprof_strings
+         }.get(self._viewer_raw_items[raw_idx], lambda: None)()
+
+    def _show_hprof_activities(self):
+        acts = sorted(self._hp_data["activities"], key=lambda a: not (a["destroyed"] or a["finished"]))
+        per_cls = collections.Counter(a["cls"] for a in acts)
+        rows = []
+        for a in acts:
+            if a["destroyed"] or a["finished"]:
+                state = "LEAKED?"
+            elif a["resumed"]:
+                state = "resumed"
+            elif a["stopped"]:
+                state = "stopped"
+            else:
+                state = "paused"
+            note = f"  x{per_cls[a['cls']]} instances" if per_cls[a["cls"]] > 1 else ""
+            rows.append((f"  {state:<9} {a['cls']}{note}", None))
+        if not rows:
+            rows = [("  no Activity instances in this dump", None)]
+        self._set_trace_viewer("Activities", rows,
+                               "LEAKED? = destroyed or finished but still in memory  |  Esc=back",
+                               on_back=self._show_hprof_home)
+
+    def _show_hprof_recyclers(self):
+        rows = []
+        for rv in self._hp_data["recyclers"]:
+            rows.append((f"  {self._hex_id(rv['id'])}  {rv['w']}x{rv['h']:<5} {rv['adapter']:<10} "
+                         f"rows {len(rv['rows'])}  cached {rv['cached']}  pooled {rv['pooled']}", rv))
+        if not rows:
+            rows = [("  no RecyclerViews in this dump", None)]
+        self._set_trace_viewer("RecyclerViews", rows,
+                               "id, size, adapter, live row views  |  Enter=row contents  Esc=back",
+                               on_enter=self._on_hprof_recycler, on_back=self._show_hprof_home)
+
+    def _on_hprof_recycler(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items) or not isinstance(self._viewer_raw_items[raw_idx], dict):
+            return
+        rv = self._viewer_raw_items[raw_idx]
+        rows = [(f"  {self._hex_id(rv['id'])}  {rv['w']}x{rv['h']}  adapter {rv['adapter']}  "
+                 f"cached {rv['cached']}  pooled {rv['pooled']}  scrap {rv['scrap']}", None)]
+        if not rv["rows"]:
+            rows.append(("  no row views are attached to this RecyclerView", None))
+        for i, row in enumerate(rv["rows"]):
+            rows.append((f"  row {i}  {row['cls']}", None))
+            rows += [(f"        {t}", None) for t in row["texts"]]
+        self._set_trace_viewer("RecyclerView rows", rows, "text shown in each live row  |  Esc=back",
+                               on_back=self._show_hprof_recyclers)
+
+    def _show_hprof_bitmaps(self):
+        bms = self._hp_data["bitmaps"]
+        if self._hp_bitmap_sort == "ratio":
+            bms = sorted(bms, key=lambda b: -(b["ratio"] or 0))
+        rows = []
+        for b in bms:
+            v = b["view"]
+            vtxt = f"view {v['w']}x{v['h']}" if v else "view -"
+            rtxt = f"{b['ratio']}x" if b["ratio"] else "-"
+            flag = "OVERSIZED " if b["ratio"] and b["ratio"] >= 1.5 else ""
+            src = b["url"] or ("held by " + ", ".join(b["holders"]) if b["holders"] else "")
+            rows.append((f"  {b['size'] / (1 << 20):>5.1f}MB {b['w']}x{b['h']:<5} {vtxt:<16} {rtxt:>6} {flag}{src}", b))
+        if not rows:
+            rows = [("  no bitmaps in this dump", None)]
+        self._set_trace_viewer("Bitmaps", rows,
+                               f"sort: {self._hp_bitmap_sort} (Cmd+S)  |  ratio = bitmap pixels / view pixels  |  "
+                               "type to filter by URL  |  Enter=details  Esc=back",
+                               on_enter=self._on_hprof_bitmap, on_back=self._show_hprof_home)
+
+    def _on_hprof_bitmap(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items) or not isinstance(self._viewer_raw_items[raw_idx], dict):
+            return
+        b = self._viewer_raw_items[raw_idx]
+        rows = [(f"  {b['w']}x{b['h']}  {b['size'] / (1 << 20):.1f}MB decoded (4 bytes per pixel)", None)]
+        v = b["view"]
+        if v:
+            rows.append((f"  shown in {v['cls']}  id {self._hex_id(v['id'])}  {v['w']}x{v['h']}", None))
+            if b["ratio"]:
+                rows.append((f"  bitmap has {b['ratio']}x the pixels of its view", None))
+        else:
+            rows.append(("  no ImageView found holding it (Compose, drawable cache or other holder)", None))
+        rows.append(("  source URL:", None))
+        rows += [(f"    {c}", None) for c in self._chunks(b["url"])] if b["url"] else [("    not found", None)]
+        if b["holders"]:
+            rows.append(("  held by: " + ", ".join(b["holders"]), None))
+        self._set_trace_viewer("Bitmap", rows, "Esc=back", on_back=self._show_hprof_bitmaps)
+
+    def _show_hprof_strings(self):
+        s = self._hp_data["strings"]
+        rows = [(f"  {s['distinct']:,} distinct strings, {s['dup_strings']} with duplicates, "
+                 f"{s['extra_copies']} extra copies", None),
+                (f"  {'wasted':>9} {'copies':>7} {'length':>7}  value", None)]
+        for e in s["top"]:
+            wasted = (e["count"] - 1) * e["len"]
+            preview = e["value"][:80].replace("\n", " ")
+            rows.append((f"  {wasted:>9,} x{e['count']:<6} {e['len']:>7}  {preview}", e))
+        self._set_trace_viewer("Duplicate strings", rows,
+                               "wasted = extra copies x length (chars)  |  type to filter  |  Enter=full value  Esc=back",
+                               on_enter=self._on_hprof_string, on_back=self._show_hprof_home)
+
+    def _on_hprof_string(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items) or not isinstance(self._viewer_raw_items[raw_idx], dict):
+            return
+        e = self._viewer_raw_items[raw_idx]
+        rows = [(f"  {e['count']} copies, {e['len']} chars each  ({(e['count'] - 1) * e['len']:,} chars wasted)", None)]
+        if e["len"] > len(e["value"]):
+            rows.append((f"  showing first {len(e['value'])} of {e['len']} chars", None))
+        rows += [(f"  {c}", None) for c in self._chunks(e["value"])]
+        self._set_trace_viewer("String value", rows, "Esc=back", on_back=self._show_hprof_strings)
 
     def _enter_capture_settings(self):
         self.state = "capture-settings"
