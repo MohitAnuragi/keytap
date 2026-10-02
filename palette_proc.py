@@ -1848,9 +1848,11 @@ class PaletteWindow:
         cache = meta["path"] + ".detail.json"
         if os.path.isfile(cache) and os.path.getmtime(cache) >= os.path.getmtime(meta["path"]):
             with open(cache) as f:
-                self._hp_data = json.load(f)
-            self._show_hprof_home()
-            return
+                cached = json.load(f)
+            if cached.get("version") == 2:   # hprof_analysis.CACHE_VERSION; older layouts are re-analysed
+                self._hp_data = cached
+                self._show_hprof_home()
+                return
         self._set_trace_viewer("Detail Snapshot",
                                [("  analyzing dump...  (about 5 seconds, then cached)", None)],
                                "Esc=back", on_back=self._enter_hprof_list)
@@ -1895,7 +1897,7 @@ class PaletteWindow:
             (f"  Bitmaps           - {len(bms)}, {sum(1 for b in bms if b['url'])} with source URL, "
              f"{oversized} much larger than their view", "bitmaps"),
             (f"  Duplicate strings - {s['dup_strings']} values, {s['extra_copies']} extra copies, "
-             f"{s['wasted_chars']:,} chars", "strings"),
+             f"{self._fmt_bytes(s['wasted_bytes'])} wasted", "strings"),
         ]
         self._set_trace_viewer("Detail Snapshot", rows, "Enter=open  Esc=back",
                                on_enter=self._on_hprof_home, on_back=self._enter_hprof_list)
@@ -1997,13 +1999,13 @@ class PaletteWindow:
         s = self._hp_data["strings"]
         rows = [(f"  {s['distinct']:,} distinct strings, {s['dup_strings']} with duplicates, "
                  f"{s['extra_copies']} extra copies", None),
-                (f"  {'wasted':>9} {'copies':>7} {'length':>7}  value", None)]
+                (f"  {'wasted':>9} {'copies':>7} {'size/copy':>10}  value", None)]
         for e in s["top"]:
-            wasted = (e["count"] - 1) * e["len"]
+            wasted = (e["count"] - 1) * e["bytes"]
             preview = e["value"][:80].replace("\n", " ")
-            rows.append((f"  {wasted:>9,} x{e['count']:<6} {e['len']:>7}  {preview}", e))
+            rows.append((f"  {self._fmt_bytes(wasted):>9} x{e['count']:<6} {self._fmt_bytes(e['bytes']):>10}  {preview}", e))
         self._set_trace_viewer("Duplicate strings", rows,
-                               "wasted = extra copies x length (chars)  |  type to filter  |  Enter=full value  Esc=back",
+                               "wasted = extra copies x size/copy (character data only)  |  type to filter  |  Enter=full value  Esc=back",
                                on_enter=self._on_hprof_string, on_back=self._show_hprof_home)
 
     def _on_hprof_string(self, lb_idx):
@@ -2011,7 +2013,8 @@ class PaletteWindow:
         if raw_idx >= len(self._viewer_raw_items) or not isinstance(self._viewer_raw_items[raw_idx], dict):
             return
         e = self._viewer_raw_items[raw_idx]
-        rows = [(f"  {e['count']} copies, {e['len']} chars each  ({(e['count'] - 1) * e['len']:,} chars wasted)", None)]
+        rows = [(f"  {e['count']} copies, {self._fmt_bytes(e['bytes'])} each ({e['len']:,} chars), "
+                 f"{self._fmt_bytes((e['count'] - 1) * e['bytes'])} wasted", None)]
         if e["len"] > len(e["value"]):
             rows.append((f"  showing first {len(e['value'])} of {e['len']} chars", None))
         rows += [(f"  {c}", None) for c in self._chunks(e["value"])]

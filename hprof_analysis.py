@@ -14,6 +14,7 @@ import numpy as np
 
 import hprof_parser as hp
 
+CACHE_VERSION = 2   # bump when the detail.json layout changes; older caches are re-analysed
 _URL = re.compile(r"^(https?|content|file|android\.resource|res|asset)://", re.I)
 _SKIP_HOLDERS = ("sun.misc.Cleaner", "java.", "libcore.", "dalvik.", "Class:", "obj[]", "prim[]",
                  "android.view.", "android.graphics.RenderNode", "android.util.",
@@ -221,22 +222,24 @@ class Analyzer:
     def strings(self):
         h = self.h
         sc = self.by_name.get("java.lang.String")
-        counts = collections.Counter()
+        counts, nbytes = collections.Counter(), {}
         for oid, _, _ in h.instances.get(sc, []):
-            s = h.java_string(oid)
+            s, n = h.java_string_info(oid)
             if s:
                 counts[s] += 1
+                nbytes[s] = n
         dups = [(s, c) for s, c in counts.items() if c > 1]
-        dups.sort(key=lambda x: -(x[1] - 1) * len(x[0]))
+        dups.sort(key=lambda x: -(x[1] - 1) * nbytes[x[0]])
         return {"distinct": len(counts), "dup_strings": len(dups),
                 "extra_copies": sum(c - 1 for _, c in dups),
-                "wasted_chars": sum((c - 1) * len(s) for s, c in dups),
-                "top": [{"value": s[:_STRING_CAP], "len": len(s), "count": c} for s, c in dups[:_STRINGS_TOP]]}
+                "wasted_bytes": sum((c - 1) * nbytes[s] for s, c in dups),
+                "top": [{"value": s[:_STRING_CAP], "len": len(s), "bytes": nbytes[s], "count": c}
+                        for s, c in dups[:_STRINGS_TOP]]}
 
 
 def analyze(path):
     a = Analyzer(path)
-    result = {"counts": {"instances": len(a.h.inst_by_id), "classes": len(a.h.classes)},
+    result = {"version": CACHE_VERSION, "counts": {"instances": len(a.h.inst_by_id), "classes": len(a.h.classes)},
               "activities": a.activities(), "recyclers": a.recyclers(),
               "bitmaps": a.bitmaps(), "strings": a.strings()}
     with open(path + ".detail.json", "w") as f:

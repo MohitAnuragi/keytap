@@ -166,15 +166,20 @@ class Hprof:
                 p += _SIZE[t]
         return out
 
-    def java_string(self, oid):
-        """Content of a java.lang.String. ART keeps characters in a synthesized array."""
+    def java_string_info(self, oid):
+        """(text, bytes of character data) of a java.lang.String. ART dumps compressed strings as
+        1-byte-per-char arrays and others as 2-byte; the header of the String object is not counted."""
         f = self.read(oid)
         arr = f.get("java.lang.String.value")
         if arr in self.prim_arrays:
             t, n, off = self.prim_arrays[arr]
             raw = bytes(self.m[off:off + n * _SIZE[t]])
-            return raw.decode("utf-16-be" if t == CHAR else "latin-1", "replace")
-        return None
+            return raw.decode("utf-16-be" if t == CHAR else "latin-1", "replace"), len(raw)
+        return None, 0
+
+    def java_string(self, oid):
+        """Content of a java.lang.String. ART keeps characters in a synthesized array."""
+        return self.java_string_info(oid)[0]
 
 
     # ── reference graph ───────────────────────────────────────────────────────
