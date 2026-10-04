@@ -1,9 +1,12 @@
-#!/usr/bin/env python3
+#!/opt/homebrew/bin/python3
 """
 Headless replay of a recording, for nightly smoke runs. No window, no keyboard.
 
-  python replay.py <recording dir or actions.json> [--serial ID] [--repeat N]
-                   [--reset stop|clear] [--retries N] [--wait SECONDS] [--network]
+  ./replay.py <name> [--repeat N] [--reset stop|clear] [--retries N] [--wait SECONDS] [--network]
+  ./replay.py --list            (or no arguments) shows the recordings
+
+<name> is part of a recording's name, "latest", or a path. The phone is picked automatically
+when only one is attached, otherwise pass --serial ID.
 
 Each run writes <out>/run_NN/result.json (per-step status and timing) and, when a step fails,
 <out>/run_NN/failure/ (screenshot, hierarchy, logcat, failure.json with the cause).
@@ -22,6 +25,25 @@ import threading
 import time
 
 
+EPILOG = """examples:
+  ./replay.py                                  list the recordings
+  ./replay.py commsFE_v2                       run one recording once
+  ./replay.py commsFE_v2 --repeat 10           run it 10 times and see what is flaky
+  ./replay.py latest --reset stop              newest recording, app force-stopped first
+  ./replay.py commsFE_v2 --retries 1 --wait 20 forgive one slow step, wait longer for elements
+
+results (in data/runs/<name>_<time>/):
+  summary.json              passes, failing steps, causes, timings (min / median / max)
+  run_NN/result.json        every step: status, ms, retries, error
+  run_NN/replay.log         what the replay printed
+  run_NN/failure/           on a failed step: screenshot.png, hierarchy.xml, logcat.txt, failure.json
+
+failure causes:  device_unavailable, app_crash, wrong_app_in_foreground, element_not_found, action_failed
+
+exit code:  0 all runs passed   1 a step failed   2 phone or uiautomator2 unreachable, bad recording or name
+"""
+
+
 def _spread(values, unit):
     return {f"min_{unit}": min(values), f"median_{unit}": statistics.median(values), f"max_{unit}": max(values)}
 
@@ -38,6 +60,43 @@ def _timings(results):
                       "failed": sum(h["status"] == "fail" for h in hits)})
     total = _spread([r["duration_s"] for r in ran], "s") if ran else {}
     return total, steps
+
+
+def _print_list(items, folder=False):
+    """Recordings, newest first. folder=True shows the folder name, which is what to type when
+    several recordings share a name."""
+    for i in items:
+        label = os.path.basename(i["path"]) if folder else i["name"]
+        when = i["recorded_at"][:16].replace("T", " ")
+        net = "  network" if i["has_network"] else ""
+        print(f"  {label:<44} {when}  {i['action_count']:>3} steps{net}")
+    if not items:
+        print("  (none)")
+
+
+def _resolve(query):
+    """Recording path for a path, "latest", or part of a name. When that is not exactly one
+    recording, prints the choices and returns None."""
+    from recording import Recording
+    if os.path.exists(query):
+        return query
+    items = Recording.list_all()
+    if query == "latest" and items:
+        return items[0]["path"]
+    q = query.lower()
+    hits = [i for i in items if q in os.path.basename(i["path"]).lower() or q in i["name"].lower()]
+    exact = [i for i in hits if query in (i["name"], os.path.basename(i["path"]))]
+    if len(exact) == 1:
+        return exact[0]["path"]
+    if len(hits) == 1:
+        return hits[0]["path"]
+    if hits:
+        print(f"'{query}' matches {len(hits)} recordings, be more specific:")
+        _print_list(hits, folder=True)
+    else:
+        print(f"no recording matches '{query}'. Recordings:")
+        _print_list(items)
+    return None
 
 
 def _package(rec, override):
@@ -109,25 +168,50 @@ def _run_once(rec, args, run_dir, package, health):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Headless replay of a keytap recording")
-    ap.add_argument("recording", help="recording directory or actions.json")
-    ap.add_argument("--serial", help="adb serial of the phone")
-    ap.add_argument("--out", help="run folder (default: data/runs/<name>_<time>)")
-    ap.add_argument("--repeat", type=int, default=1, help="run the recording N times")
-    ap.add_argument("--mode", choices=["fast", "timed"], default="fast")
-    ap.add_argument("--wait", type=float, default=10.0,
-                    help="extra seconds to keep looking for an element after the wait recorded for that step")
-    ap.add_argument("--retries", type=int, default=0, help="extra attempts for a failed step")
-    ap.add_argument("--reset", choices=["stop", "clear"],
-                    help="before each run: force-stop the app (stop), or also clear its data (clear)")
-    ap.add_argument("--package", help="app to reset (default: first package in the recording)")
-    ap.add_argument("--network", action="store_true", help="serve the recorded network flows")
+    ap = argparse.ArgumentParser(
+        prog="replay.py", formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Headless replay of a keytap recording on a connected phone.",
+        epilog=EPILOG)
+    ap.add_argument("recording", nargs="?",
+                    help='part of a recording name, its folder name, "latest", or a path. '
+                         "With no name, the recordings are listed.")
+    ap.add_argument("--list", action="store_true", help="list the recordings and exit")
+    run = ap.add_argument_group("how to run")
+    run.add_argument("--repeat", type=int, default=1, metavar="N",
+                     help="run the recording N times in a row (default: 1)")
+    run.add_argument("--serial", metavar="ID",
+                     help="adb serial of the phone (default: the only attached phone)")
+    run.add_argument("--mode", choices=["fast", "timed"], default="fast",
+                     help="fast: 0.3s between steps. timed: keep the pauses of the recording (default: fast)")
+    wait = ap.add_argument_group("waiting and retries")
+    wait.add_argument("--wait", type=float, default=10.0, metavar="SECONDS",
+                      help="element taps wait as long as the recording did, then keep looking this many "
+                           "seconds more (default: 10)")
+    wait.add_argument("--retries", type=int, default=0, metavar="N",
+                      help="extra attempts for a step that failed (default: 0)")
+    state = ap.add_argument_group("start state and network")
+    state.add_argument("--reset", choices=["stop", "clear"],
+                       help="before each run: force-stop the app (stop), or also wipe its data and "
+                            "login (clear). Default: no reset. A recording that starts with force_stop "
+                            "needs neither.")
+    state.add_argument("--package", metavar="PKG",
+                       help="app to reset (default: the first package in the recording)")
+    state.add_argument("--network", action="store_true",
+                       help="serve the recorded network responses (needs a full-dump recording)")
+    ap.add_argument("--out", metavar="DIR", help="results folder (default: data/runs/<name>_<time>)")
     args = ap.parse_args()
 
     from paths import RUNS_DIR
     from recording import Recording, check_actions_file
 
-    path = args.recording
+    if args.list or not args.recording:
+        _print_list(Recording.list_all())
+        if not args.list:
+            print("\nusage: ./replay.py <name> [--repeat N]   (./replay.py --help for all options)")
+        return 0
+    path = _resolve(args.recording)
+    if path is None:
+        return 2
     actions_json = os.path.join(path, "actions.json") if os.path.isdir(path) else path
     problems = check_actions_file(actions_json)
     if problems:
@@ -140,6 +224,17 @@ def main():
     if args.reset and not package:
         print("--reset needs a package: pass --package, or record a launch step")
         return 2
+
+    if not args.serial:
+        from adb import list_devices
+        devices = list_devices()
+        if len(devices) == 1:
+            args.serial = devices[0]
+            import config
+            config.ARGS.serial = args.serial   # adb() reads the serial from here
+        elif devices:
+            print("several phones attached, pass --serial: " + ", ".join(devices))
+            return 2
 
     import actions
     actions.set_sync(True)

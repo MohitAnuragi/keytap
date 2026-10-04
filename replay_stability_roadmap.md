@@ -8,7 +8,7 @@ Findings below come from reading `replayer.py`, `recorder.py`, `recording.py`, `
 
 ## Shipped (first batch)
 
-Headless run: `python replay.py <recording> --serial <id> --repeat 10 --reset clear`
+Headless run: `./replay.py commsFE_v2 --repeat 10`. The name is part of a recording's name (or its folder name), `latest`, or a path. `./replay.py` or `--list` shows the recordings. If a name matches several, it lists them and exits 2. The phone is picked automatically when exactly one is attached, otherwise pass `--serial`. The script runs with the Homebrew Python (shebang), which has uiautomator2.
 
 - **`replay.py`:** no window. Checks the recording with `check_actions_file`, wakes the phone, optionally force-stops (`--reset stop`) or clears the app (`--reset clear`) before each run, and runs the recording `--repeat N` times. Writes `data/runs/<name>_<time>/run_NN/result.json` (per-step status, ms, retries), `summary.json` (passes, which steps fail, causes, flaky flag, and timings: whole run and per step min/median/max, retries and failures, over the runs that reached each step) and a `replay.log`. `--network` serves the recorded flows. Exit code: 0 all passed, 1 a step failed, 2 phone or uiautomator2 unreachable.
 - **Actions run inline during replay** (`actions.set_sync`). Before, every action was a fire-and-forget thread, so `force_stop`, `clear_data` and `launch` could overlap. The GUI replay gets this too.
