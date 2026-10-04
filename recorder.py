@@ -59,6 +59,7 @@ class ActionRecorder:
             content_desc=element.get("content_desc", ""),
             text=element.get("text", ""),
             class_name=element.get("class_name", ""),
+            index=element.get("index"),
         )
         reliable = bool(sel.resource_id or sel.content_desc or sel.text)
         self._actions.append(Action(

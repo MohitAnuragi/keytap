@@ -4,14 +4,27 @@ Call any function with on_status=callable to get a status string back.
 """
 
 import os
+import re
 import threading
 import time
 
 from adb import adb
 
 
+_local = threading.local()
+
+
+def set_sync(on: bool):
+    """Run this thread's actions inline instead of in a daemon thread. The replayer turns this
+    on so each step finishes before the next one starts."""
+    _local.sync = on
+
+
 def _run(fn):
-    threading.Thread(target=fn, daemon=True).start()
+    if getattr(_local, "sync", False):
+        fn()
+    else:
+        threading.Thread(target=fn, daemon=True).start()
 
 def run_async(fn):
     """Public alias for fire-and-forget thread dispatch."""
@@ -74,11 +87,28 @@ def launch_deeplink(url, on_status=None):
 
 # ── App management ───────────────────────────────────────────────────────────
 
+def launcher_activity(pkg):
+    """The app's own launcher activity as 'pkg/Activity', or None. Debug tools such as LeakCanary
+    add a second launcher entry to the same package, so monkey would pick one at random."""
+    out = adb("shell", "cmd", "package", "query-activities", "--brief",
+              "-a", "android.intent.action.MAIN", "-c", "android.intent.category.LAUNCHER",
+              pkg).stdout.decode(errors="replace")
+    found = re.findall(rf"^\s*({re.escape(pkg)}/\S+)\s*$", out, re.M)
+    return next((a for a in found if "leakcanary" not in a.lower()), found[0] if found else None)
+
+
 def launch(pkg, on_status=None):
     if on_status:
         on_status(f"launch {pkg}")
-    _run(lambda: adb("shell", "monkey", "-p", pkg,
-                     "-c", "android.intent.category.LAUNCHER", "1"))
+
+    def _do():
+        comp = launcher_activity(pkg)
+        if comp:
+            adb("shell", "am", "start", "-a", "android.intent.action.MAIN",
+                "-c", "android.intent.category.LAUNCHER", "-n", comp)
+        else:
+            adb("shell", "monkey", "-p", pkg, "-c", "android.intent.category.LAUNCHER", "1")
+    _run(_do)
 
 
 def force_stop(pkg, on_status=None):

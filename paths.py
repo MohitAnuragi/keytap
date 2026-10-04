@@ -13,6 +13,7 @@ DATA_DIR = Path(os.environ.get("KEYTAP_DATA_DIR") or ROOT / "data")
 
 RECORDINGS_DIR = DATA_DIR / "recordings"
 TRACES_DIR     = DATA_DIR / "traces"
+RUNS_DIR       = DATA_DIR / "runs"
 HEAPS_DIR      = DATA_DIR / "heaps"
 HPROFS_DIR     = DATA_DIR / "hprofs"
 SCRCPY_DIR     = DATA_DIR / "scrcpy"

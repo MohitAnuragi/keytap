@@ -15,6 +15,9 @@ from recording import Action, ElementSelector, Recording, action_label
 
 class ActionReplayer:
     FAST_DELAY_MS = 300
+    RETRY_PAUSE_S = 1.0
+    MAX_SCROLLS = 8
+    MAX_RECORDED_WAIT_S = 60   # a long pause in the recording must not stall a nightly run
 
     def __init__(self):
         self.active = False
@@ -23,6 +26,11 @@ class ActionReplayer:
         self._step_event = threading.Event()
         self._on_status = None
         self._u2_dev = None
+        self._u2_error = ""
+        self.extra_wait_s = 10.0        # keep looking this long after the recorded wait
+        self._recorded_wait_s = 0.0     # wait still owed for the current step (its gap in the recording)
+        self.default_retries = 0        # extra attempts when a step has no retries
+        self.results = []               # one dict per step run: step, label, status, ms, retries, error
         self._current_step = 0   # 0-indexed; set before _wait_between so overlay reflects waiting step
         self._recording = None   # Recording being replayed; None when idle
 
@@ -34,6 +42,11 @@ class ActionReplayer:
     def recording(self):
         return self._recording
 
+    @property
+    def u2_device(self):
+        """The uiautomator2 connection of the last replay, or None."""
+        return self._u2_dev
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     def start(self, recording: Recording, mode: str, serial: str,
@@ -42,6 +55,7 @@ class ActionReplayer:
         self.active = True
         self._recording = recording
         self._current_step = 0
+        self.results = []
         self._stop_event.clear()
         self._step_event.clear()
         threading.Thread(
@@ -63,6 +77,7 @@ class ActionReplayer:
 
     def _run(self, recording, serial, on_status, on_done, device_resolution):
         self._on_status = on_status
+        actions.set_sync(True)   # each step finishes before the next starts
         total = len(recording.actions)
 
         if device_resolution and recording.device_resolution != list(device_resolution):
@@ -71,14 +86,15 @@ class ActionReplayer:
                 f"device is {list(device_resolution)} — coords may miss"
             )
 
-        # Pre-connect u2 once for the whole replay if element_tap actions exist
-        has_elem_taps = any(a.type == "element_tap" for a in recording.actions)
-        if has_elem_taps:
+        # Pre-connect u2 once for the whole replay if any step looks up elements
+        self._u2_error = ""
+        if any(a.type in ("element_tap", "scroll_to") for a in recording.actions):
             try:
                 import uiautomator2 as u2
                 self._u2_dev = u2.connect(serial) if serial else u2.connect()
-            except Exception:
+            except Exception as e:
                 self._u2_dev = None
+                self._u2_error = f"{type(e).__name__}: {e}"
         else:
             self._u2_dev = None
 
@@ -100,9 +116,27 @@ class ActionReplayer:
                 self._recording = None
                 return
 
+            gap_s = min(max(action.t - prev_t, 0) / 1000, self.MAX_RECORDED_WAIT_S)
+            # timed mode already slept the gap (up to 10s) before the step
+            self._recorded_wait_s = gap_s - (min(gap_s, 10) if self.mode == "timed" else 0)
             prev_t = action.t
 
-            ok, error = self._execute(action, serial)
+            retries = action.retries if action.retries is not None else self.default_retries
+            started = time.time()
+            ok, error = self._execute_safe(action, serial)
+            attempt = 0
+            while (not ok and attempt < retries and not self._stop_event.is_set()
+                   and not error.startswith("uiautomator2 unavailable")):
+                attempt += 1
+                on_status(f"[RETRY {attempt}/{retries}] step {i + 1}: {error}")
+                time.sleep(self.RETRY_PAUSE_S)
+                ok, error = self._execute_safe(action, serial)
+            self.results.append({
+                "step": i + 1, "label": action_label(action),
+                "status": "pass" if ok else "fail",
+                "ms": int((time.time() - started) * 1000),
+                "retries": attempt, "error": error,
+            })
             if not ok:
                 on_status(f"[REPLAY ERROR] step {i + 1}: {error}")
                 self.active = False
@@ -126,6 +160,12 @@ class ActionReplayer:
             if gap_s > 0:
                 time.sleep(min(gap_s, 10))  # cap at 10s to guard against huge pauses
 
+    def _execute_safe(self, action: Action, serial: str):
+        try:
+            return self._execute(action, serial)
+        except Exception as e:   # sync actions raise (adb timeout, missing adb) where threads swallowed
+            return False, f"{action.type} failed: {type(e).__name__}: {e}"
+
     def _execute(self, action: Action, serial: str):
         """Dispatch one action. Returns (success, error_msg)."""
         t = action.type
@@ -133,6 +173,8 @@ class ActionReplayer:
             actions.tap(action.x, action.y)
         elif t == "element_tap":
             return self._execute_element_tap(action, serial)
+        elif t == "scroll_to":
+            return self._execute_scroll_to(action)
         elif t == "swipe":
             actions.swipe(action.x1, action.y1, action.x2, action.y2,
                           duration=action.duration or 300)
@@ -160,48 +202,77 @@ class ActionReplayer:
             return False, f"unknown action type: {t}"
         return True, None
 
-    def _execute_element_tap(self, action: Action, serial: str):
-        dev = self._u2_dev
-        if dev is not None:
-            el, last_exc = self._wait_for_element(dev, action.selector)
+    def _unavailable(self) -> str:
+        return f"uiautomator2 unavailable: {self._u2_error or 'not connected'}"
 
+    @staticmethod
+    def _describe(sel: ElementSelector) -> str:
+        return sel.resource_id or sel.content_desc or sel.text or "?"
+
+    def _execute_element_tap(self, action: Action, serial: str):
+        sel = action.selector
+        # wait as long as the user waited in the recording, then keep looking for extra_wait_s more;
+        # timeout_ms on the step replaces both with one fixed wait
+        if action.timeout_ms:
+            recorded_s, timeout_s = 0.0, action.timeout_ms / 1000
+        else:
+            recorded_s = self._recorded_wait_s
+            timeout_s = recorded_s + self.extra_wait_s
+        dev = self._u2_dev
+        last_exc = None
+        if dev is not None:
+            el, last_exc = self._wait_for_element(dev, sel, timeout_s, recorded_s)
             if el is not None:
                 cx, cy = el.center()
                 actions.tap(cx, cy)
                 return True, None
 
-            # Not found after wait — try fallback
-            if not action.reliable and action.fallback_coords:
-                cx, cy = action.fallback_coords
-                sel = action.selector
-                name = sel.resource_id or sel.content_desc or sel.text or "?"
-                msg = "element lookup error" if last_exc else f"element '{name}' not found"
-                if self._on_status:
-                    self._on_status(f"[WARN] {msg} after 2s wait, using fallback_coords")
-                actions.tap(cx, cy)
-                return True, None
+        # not found (or no u2): coordinates only for taps recorded without any identifier
+        if not action.reliable and action.fallback_coords:
+            cx, cy = action.fallback_coords
+            if self._on_status:
+                why = "u2 unavailable" if dev is None else f"element not found after {timeout_s:g}s wait"
+                self._on_status(f"[WARN] {why}, using fallback_coords")
+            actions.tap(cx, cy)
+            return True, None
 
-            if last_exc:
-                return False, f"element lookup failed: {last_exc}"
-            sel = action.selector
-            desc = sel.resource_id or sel.content_desc or sel.text or "?"
-            return False, f"element '{desc}' not found after 2s wait"
-        else:
-            # u2 not connected — fall back to coords if possible
-            if not action.reliable and action.fallback_coords:
-                cx, cy = action.fallback_coords
-                if self._on_status:
-                    self._on_status("[WARN] u2 unavailable, using fallback_coords")
-                actions.tap(cx, cy)
-                return True, None
+        if dev is None:
+            return False, self._unavailable()
+        if last_exc:
+            return False, f"element lookup failed: {last_exc}"
+        waited = f"{recorded_s:.1f}s recorded + {timeout_s - recorded_s:g}s more" if recorded_s else f"{timeout_s:g}s"
+        return False, f"element '{self._describe(sel)}' not found after {waited}"
 
+    def _execute_scroll_to(self, action: Action):
+        """Swipe until the element is on screen. Does not tap it."""
+        dev = self._u2_dev
+        if dev is None:
+            return False, self._unavailable()
         sel = action.selector
-        desc = sel.resource_id or sel.content_desc or sel.text or "?"
-        return False, f"element '{desc}' not found"
+        down = action.direction != "up"
+        w, h = dev.window_size()
+        hi, lo = int(h * 0.7), int(h * 0.3)
+        for n in range(self.MAX_SCROLLS + 1):
+            try:
+                if self._find_element(dev, sel) is not None:
+                    return True, None
+            except Exception as e:
+                return False, f"element lookup failed: {e}"
+            if n == self.MAX_SCROLLS or self._stop_event.is_set():
+                break
+            if self._on_status:
+                self._on_status(f"[SCROLL {n + 1}/{self.MAX_SCROLLS}] looking for '{self._describe(sel)}'")
+            actions.swipe(w // 2, hi if down else lo, w // 2, lo if down else hi)
+            time.sleep(0.5)   # let the list settle before looking again
+        return False, (f"element '{self._describe(sel)}' not found after "
+                       f"{self.MAX_SCROLLS} scrolls {'down' if down else 'up'}")
 
-    def _wait_for_element(self, dev, selector: ElementSelector, timeout_s: float = 2.0):
-        """Poll for element up to timeout_s. Returns (element_or_None, last_exc_or_None)."""
-        deadline = time.time() + timeout_s
+    def _wait_for_element(self, dev, selector: ElementSelector, timeout_s: float, recorded_s: float = 0.0):
+        """Poll for element up to timeout_s. Returns (element_or_None, last_exc_or_None).
+        A lookup call can block while the app is busy, so the deadline is checked between calls."""
+        start = time.time()
+        deadline = start + timeout_s
+        extra_noted = recorded_s <= 0
         last_exc = None
         first = True
         while True:
@@ -212,31 +283,41 @@ class ActionReplayer:
             except Exception as e:
                 last_exc = e
 
-            if time.time() >= deadline:
+            if time.time() >= deadline or self._stop_event.is_set():
                 break
 
             if first:
-                name = selector.resource_id or selector.content_desc or selector.text or "?"
                 if self._on_status:
-                    self._on_status(f"[WAIT] looking for '{name}'...")
+                    self._on_status(f"[WAIT] looking for '{self._describe(selector)}'...")
                 first = False
+
+            if not extra_noted and time.time() >= start + recorded_s:
+                extra_noted = True
+                if self._on_status:
+                    self._on_status(f"[WAIT] not there after the recorded {recorded_s:.1f}s, "
+                                    f"trying up to {timeout_s - recorded_s:g}s more")
 
             time.sleep(0.2)
 
         return None, last_exc
 
     def _find_element(self, dev, selector: ElementSelector):
-        """Try selector fields in priority order. Returns u2 UiObject or None."""
+        """Try selector fields in priority order. Returns u2 UiObject or None.
+        The recorded index applies to the first identifier set, the one it was counted for."""
         checks = [
-            (selector.resource_id, lambda v: dev(resourceId=v)),
-            (selector.content_desc, lambda v: dev(description=v)),
-            (selector.text,         lambda v: dev(text=v)),
+            ("resourceId", selector.resource_id),
+            ("description", selector.content_desc),
+            ("text", selector.text),
         ]
-        for value, factory in checks:
+        primary = next((k for k, v in checks if v), None)
+        for key, value in checks:
             if not value:
                 continue
+            kwargs = {key: value}
+            if key == primary and selector.index:
+                kwargs["instance"] = selector.index
             try:
-                el = factory(value)
+                el = dev(**kwargs)
                 if el.exists:
                     return el
             except Exception:

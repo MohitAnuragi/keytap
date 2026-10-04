@@ -24,12 +24,13 @@ class ElementSelector:
     content_desc: str = ""
     text: str = ""
     class_name: str = ""
+    index: Optional[int] = None   # 0-based position among on-screen matches; set only when several match
 
 
 @dataclass
 class Action:
     t: int           # ms since recording start
-    type: str        # tap | element_tap | swipe | input_text | launch | launch_deeplink | keyevent | wait | force_stop | clear_data | permission | dev_option
+    type: str        # tap | element_tap | scroll_to | swipe | input_text | launch | launch_deeplink | keyevent | wait | force_stop | clear_data | permission | dev_option
     # tap
     x: Optional[int] = None
     y: Optional[int] = None
@@ -55,11 +56,16 @@ class Action:
     # permission (package + permission, or "*" for all) and dev_option: the state it was set to
     permission: Optional[str] = None
     state: Optional[str] = None
+    # replay options, hand-edited: element wait in ms (element_tap, default 10s), extra attempts
+    # when a step fails (default 0), scroll_to direction (down | up)
+    timeout_ms: Optional[int] = None
+    retries: Optional[int] = None
+    direction: Optional[str] = None
 
     def to_dict(self):
         d = asdict(self)
         if self.selector:
-            d["selector"] = asdict(self.selector)
+            d["selector"] = _compact(asdict(self.selector))
         return _compact(d)
 
 
@@ -196,6 +202,9 @@ class Recording:
                 label=a.get("label"),
                 permission=a.get("permission"),
                 state=a.get("state"),
+                timeout_ms=a.get("timeout_ms"),
+                retries=a.get("retries"),
+                direction=a.get("direction"),
             ))
         return actions
 
@@ -249,6 +258,12 @@ def action_label(action: "Action") -> str:
         if name and "/" in name:
             name = name.split("/")[-1]  # strip package prefix from resource_id
         return f"element_tap: {name or '?'}"
+    elif t == "scroll_to":
+        sel = action.selector
+        name = sel and (sel.resource_id or sel.content_desc or sel.text)
+        if name and "/" in name:
+            name = name.split("/")[-1]
+        return f"scroll_to: {name or '?'} ({action.direction or 'down'})"
     elif t == "tap":
         return f"tap ({action.x}, {action.y})"
     elif t == "swipe":
@@ -290,10 +305,15 @@ _REQUIRED = {
     "keyevent":        ("keycode",),
     "wait":            ("duration",),
     "element_tap":     ("selector",),
+    "scroll_to":       ("selector",),
     "permission":      ("package", "permission", "state"),
     "dev_option":      ("label", "state"),
 }
-_SELECTOR_KEYS = {"resource_id", "content_desc", "text", "class_name"}
+_SELECTOR_KEYS = {"resource_id", "content_desc", "text", "class_name", "index"}
+
+
+def _is_count(v):
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
 
 
 def check_actions_file(path: str) -> List[str]:
@@ -335,18 +355,25 @@ def check_actions_file(path: str) -> List[str]:
                 problems.append(f'{where} ({typ}): needs "{field_name}"')
         if typ == "permission" and a.get("state") not in (None, "GRANTED", "DENIED"):
             problems.append(f'{where} (permission): "state" must be "GRANTED" or "DENIED"')
-        if typ == "element_tap" and isinstance(a.get("selector"), dict):
+        if typ in ("element_tap", "scroll_to") and isinstance(a.get("selector"), dict):
             sel = a["selector"]
             extra = set(sel) - _SELECTOR_KEYS
             if extra:
                 problems.append(f'{where}: unknown selector keys {sorted(extra)} (allowed: {sorted(_SELECTOR_KEYS)})')
+            if "index" in sel and not _is_count(sel["index"]):
+                problems.append(f'{where}: selector "index" must be a whole number, 0 or more')
             fb = a.get("fallback_coords")
-            has_fallback = isinstance(fb, list) and len(fb) == 2
+            has_fallback = typ == "element_tap" and isinstance(fb, list) and len(fb) == 2
             if not (sel.get("resource_id") or sel.get("content_desc") or sel.get("text")) and not has_fallback:
-                problems.append(f"{where}: selector needs resource_id, content_desc or text "
-                                f'(or "fallback_coords": [x, y] to tap by position)')
-        elif typ == "element_tap" and a.get("selector") is not None:
+                hint = ' (or "fallback_coords": [x, y] to tap by position)' if typ == "element_tap" else ""
+                problems.append(f"{where}: selector needs resource_id, content_desc or text{hint}")
+        elif typ in ("element_tap", "scroll_to") and a.get("selector") is not None:
             problems.append(f'{where}: "selector" must be an object')
+        for opt in ("timeout_ms", "retries"):
+            if opt in a and not _is_count(a[opt]):
+                problems.append(f'{where}: "{opt}" must be a whole number, 0 or more')
+        if a.get("direction") not in (None, "up", "down"):
+            problems.append(f'{where}: "direction" must be "up" or "down"')
     return problems
 
 

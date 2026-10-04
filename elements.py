@@ -48,7 +48,16 @@ def dump_elements(serial=None):
     elements = []
     bounds_index = {}  # bounds -> index in elements; used to replace layouts with widgets
 
+    seen = {}  # (kind, value) -> nodes so far with that identifier, any node, document order
+
     for node in root.iter('node'):
+        pos = {}
+        for kind, attr in (('resource_id', 'resource-id'), ('content_desc', 'content-desc'), ('text', 'text')):
+            value = node.get(attr, '')
+            if value:
+                pos[kind] = seen.get((kind, value), 0)
+                seen[(kind, value)] = pos[kind] + 1
+
         clickable = node.get('clickable') == 'true'
         focusable = node.get('focusable') == 'true'
         if not (clickable or focusable):
@@ -76,6 +85,7 @@ def dump_elements(serial=None):
             'content_desc': content_desc,
             'class_name':   class_name,
             'clickable':    clickable,
+            '_pos':         pos,
         }
 
         if bounds in bounds_index:
@@ -97,6 +107,13 @@ def dump_elements(serial=None):
             el['label'] = LABELS[len(elements)]
             bounds_index[bounds] = len(elements)
             elements.append(el)
+
+    # index: which of several same-identifier elements this is, using the identifier replay tries first
+    for el in elements:
+        pos = el.pop('_pos')
+        kind = next((k for k in ('resource_id', 'content_desc', 'text') if el[k]), None)
+        total = seen.get((kind, el[kind]), 0) if kind else 0
+        el['index'] = pos[kind] if total > 1 else None
 
     _LOG.debug("dump_elements: %d elements found", len(elements))
     return elements
