@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # keytap install script
-# Installs Python dependencies, checks system tools, and registers the
-# `keytap` shell command in your ~/.zshrc or ~/.bash_profile.
+# Installs Python dependencies, checks system tools, registers the
+# `keytap` shell command in your ~/.zshrc or ~/.bash_profile, and installs the
+# harden-recording Claude skill into ~/.claude/skills so it works from any folder.
 #
 # Usage:
-#   bash install.sh
+#   bash install.sh               # full install
+#   bash install.sh --skill-only  # only (re)install the Claude skill, e.g. after editing it
 #
 # After install, open a new terminal and run:
 #   keytap
@@ -20,6 +22,30 @@ NC='\033[0m'
 info()  { echo -e "${GREEN}[keytap]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[keytap]${NC} $*"; }
 error() { echo -e "${RED}[keytap]${NC} $*"; }
+
+# ── Claude skill ──────────────────────────────────────────────────────────────
+
+# Copies skills/harden-recording to ~/.claude/skills and writes this keytap folder's path into
+# it, so Claude can find replay.py when it is not started inside the keytap folder.
+install_skill() {
+    local src="$KEYTAP_DIR/skills/harden-recording"
+    local dst="$HOME/.claude/skills/harden-recording"
+    if [[ ! -d "$src" ]]; then
+        warn "skill not found at $src, skipping"
+        return 0
+    fi
+    rm -rf "$dst"
+    mkdir -p "$dst"
+    cp -R "$src/." "$dst/"
+    find "$dst" -name '*.md' -exec sed -i.bak "s|__KEYTAP_DIR__|$KEYTAP_DIR|g" {} +
+    find "$dst" -name '*.bak' -delete
+    info "Installed Claude skill harden-recording to $dst"
+}
+
+if [[ "${1:-}" == "--skill-only" ]]; then
+    install_skill
+    exit 0
+fi
 
 # ── Python ────────────────────────────────────────────────────────────────────
 
@@ -141,6 +167,8 @@ if [[ $ADDED -eq 0 ]]; then
     info "Created ~/.zshrc with keytap function"
 fi
 
+install_skill
+
 # ── Done ──────────────────────────────────────────────────────────────────────
 
 echo ""
@@ -154,4 +182,7 @@ echo "  Options:"
 echo "      keytap --height 1000          # taller mirror window"
 echo "      keytap --backend screenrecord # fallback capture"
 echo "      keytap --serial emulator-5554 # target specific device"
+echo ""
+echo "  Claude skill (harden a flaky recording): in Claude Code, ask it to harden a keytap recording,"
+echo "  or run: ./replay.py --help"
 echo ""

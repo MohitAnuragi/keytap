@@ -27,6 +27,7 @@ import time
 
 EPILOG = """examples:
   ./replay.py                                  list the recordings
+  ./replay.py --dump                           what is on the phone's screen now (find ids for selectors)
   ./replay.py commsFE_v2                       run one recording once
   ./replay.py commsFE_v2 --repeat 10           run it 10 times and see what is flaky
   ./replay.py commsFE_v2 --repeat 10 --quiet   final summary only, for scripts and Claude
@@ -61,6 +62,48 @@ def _timings(results):
                       "failed": sum(h["status"] == "fail" for h in hits)})
     total = _spread([r["duration_s"] for r in ran], "s") if ran else {}
     return total, steps
+
+
+def _pick_serial(args):
+    """Use the only attached phone when --serial is not given. False when several are attached."""
+    if args.serial:
+        return True
+    from adb import list_devices
+    devices = list_devices()
+    if len(devices) == 1:
+        args.serial = devices[0]
+        import config
+        config.ARGS.serial = args.serial   # adb() reads the serial from here
+    elif devices:
+        print("several phones attached, pass --serial: " + ", ".join(devices))
+        return False
+    return True
+
+
+def _dump(args):
+    """Print what is on the phone's screen: app, activity, texts and the tappable elements as
+    selectors that can be pasted into actions.json. Read-only, nothing is tapped."""
+    from failure_bundle import _FOCUS_RE, _screen
+    from utils import adb_shell
+    if not _pick_serial(args):
+        return 2
+    try:
+        import uiautomator2 as u2
+        dev = u2.connect(args.serial) if args.serial else u2.connect()
+        xml = dev.dump_hierarchy()
+    except Exception as e:
+        print(f"cannot read the screen: {type(e).__name__}: {e}")
+        return 2
+    m = _FOCUS_RE.search(adb_shell("dumpsys window | grep mCurrentFocus", args.serial))
+    screen = _screen(xml if isinstance(xml, str) else xml.decode(errors="replace"))
+    print(f"screen: {m.group(1)} / {m.group(2)}" if m else "screen: unknown app")
+    print("texts: " + " | ".join(t if len(t) <= 40 else t[:40] + "..." for t in screen["texts"]))
+    print("tappable (selectors for actions.json; index only when several share the identifier):")
+    for item in screen["clickable"]:
+        print("  " + json.dumps(item, ensure_ascii=False))
+    if not screen["clickable"]:
+        print("  (none found)")
+    return 0
 
 
 def _print_list(items, folder=False):
@@ -178,6 +221,9 @@ def main():
                     help='part of a recording name, its folder name, "latest", or a path. '
                          "With no name, the recordings are listed.")
     ap.add_argument("--list", action="store_true", help="list the recordings and exit")
+    ap.add_argument("--dump", action="store_true",
+                    help="print what is on the phone's screen now: app, texts and tappable elements "
+                         "as selectors to paste into actions.json. Read-only, taps nothing.")
     run = ap.add_argument_group("how to run")
     run.add_argument("--repeat", type=int, default=1, metavar="N",
                      help="run the recording N times in a row (default: 1)")
@@ -209,6 +255,8 @@ def main():
     from paths import RUNS_DIR
     from recording import Recording, check_actions_file
 
+    if args.dump:
+        return _dump(args)
     if args.list or not args.recording:
         _print_list(Recording.list_all())
         if not args.list:
@@ -230,16 +278,8 @@ def main():
         print("--reset needs a package: pass --package, or record a launch step")
         return 2
 
-    if not args.serial:
-        from adb import list_devices
-        devices = list_devices()
-        if len(devices) == 1:
-            args.serial = devices[0]
-            import config
-            config.ARGS.serial = args.serial   # adb() reads the serial from here
-        elif devices:
-            print("several phones attached, pass --serial: " + ", ".join(devices))
-            return 2
+    if not _pick_serial(args):
+        return 2
 
     import actions
     actions.set_sync(True)

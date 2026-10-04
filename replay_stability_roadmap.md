@@ -17,6 +17,7 @@ Headless run: `./replay.py commsFE_v2 --repeat 10`. The name is part of a record
 - **`scroll_to` action:** hand-written, `{"type": "scroll_to", "selector": {...}, "direction": "down"}`. Swipes up to 8 times until the element is on screen. It does not tap, so follow it with an `element_tap`.
 - **Failure bundle** (`failure_bundle.py`), in `run_NN/failure/`: `screenshot.png`, `hierarchy.xml`, `logcat.txt` (last 300 lines) and `failure.json` with the step, error, cause code, foreground app, the ids and texts on screen, and a `clickable` list (up to 30 tappable elements with full `resource_id`, `content_desc`, `text` and `index` when ambiguous), so a replacement selector can be chosen without opening `hierarchy.xml`. Cause codes: `device_unavailable`, `app_crash`, `wrong_app_in_foreground`, `element_not_found`, `action_failed`.
 - **`launch` picks the app's launcher activity** (`actions.launcher_activity`). Debug tools such as LeakCanary add a second launcher entry to the same package (`leakcanary.internal.activity.LeakLauncherActivity` on GoHost staging), and `monkey -p <pkg> -c LAUNCHER 1` picked one at random, so a launch sometimes opened LeakCanary. It now queries the launcher activities, skips LeakCanary and runs `am start -n`. Falls back to monkey if the query finds nothing. Also applies to the palette's launch action.
+- **`./replay.py --dump`:** prints what is on the phone's screen now: app and activity, the visible texts (long ones cut) and the tappable elements as one JSON selector per line, ready to paste into `actions.json` (full `resource_id`, `content_desc`, `text`, `index` when several share the identifier). Read-only, nothing is tapped. Use it to find the id of a coordinate tap or to check a selector before editing a recording.
 - **Validator** knows `scroll_to`, selector `index`, `timeout_ms`, `retries` and `direction`.
 
 Not done yet: wait-for-stable, screen fingerprints, network matching fixes, popup handler. Run a real journey with `--repeat 10` first and let the failures say which one is next.
@@ -179,6 +180,22 @@ Fix network matching before relying on it for smoke assertions. Wrong mocks look
 6. Per-step options, popup handler, start-state block and reset.
 7. Richer selectors and scroll-to-element.
 8. A Claude skill that runs the bake loop, proposes ignore rules and selector fixes, and promotes a recording to "stable" only after N consecutive passes. Pass or fail stays deterministic. An LLM is never the judge in CI.
+
+## Claude skill for hardening a recording (written)
+
+Lives in `skills/harden-recording/` (`SKILL.md` plus `reference/action-format.md` and `reference/failure-causes.md`). `bash install.sh` (or `bash install.sh --skill-only`) copies it to `~/.claude/skills/harden-recording/` and writes this keytap folder's path into it, so it works when Claude is not started inside the keytap folder. Edit the copy in the repo, then re-run `--skill-only`.
+
+A loop: copy the recording to `<name>_vN`, run `./replay.py <copy> --repeat 5 --quiet`, read results, make one targeted fix, run again. keytap decides pass or fail, never the model.
+
+- **Read small to large:** `summary.json`, then one failing run's `failure.json` (cause, foreground, `screen.clickable`), then only a search of `hierarchy.xml` or `logcat.txt`, and the screenshot last.
+- **Use `./replay.py --dump`** to find ids on a screen the replay did not fail on (for example the send button behind a coordinate tap) and to check a new selector.
+- **Always run with `--quiet`.**
+- **Cause to fix:** `element_not_found` to a better selector (content_desc or stable text over a shared id, `index` for repeated ids); slow step to `timeout_ms`; intermittent step to `retries: 1`; off-screen target to `scroll_to`; coordinate `tap` to an `element_tap`; `app_crash` and `device_unavailable` are reported, not edited.
+- **Guardrails:** never overwrite the original, change one step per round, ask before anything beyond tapping the app (permissions, dev options, `clear_data`, `--reset clear`), say how many real runs will happen before starting.
+- **Done when:** 10 of 10 pass, or 5 consecutive passes after the last edit, with a cap of about 5 rounds.
+- **Tooling still missing:** a `wait_for` assertion (so a pass can mean the result is right, not just that every step ran), unique input text (`{ts}`), a "stable" marker in `actions.json`.
+
+---
 
 ## Open questions
 
