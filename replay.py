@@ -19,10 +19,11 @@ import argparse
 import json
 import os
 import re
-import statistics
 import sys
-import threading
 import time
+
+import engine
+from engine import print_list as _print_list, resolve_recording as _resolve   # also used by suite.py and tests
 
 
 EPILOG = """examples:
@@ -40,44 +41,13 @@ results (in data/runs/<name>_<time>/):
   run_NN/replay.log         what the replay printed
   run_NN/failure/           on a failed step: screenshot.png, hierarchy.xml, logcat.txt, failure.json
 
-failure causes:  device_unavailable, app_crash, wrong_app_in_foreground, element_not_found, action_failed
+failure causes:  device_unavailable, load_error, app_crash, wrong_app_in_foreground, assertion_failed,
+                 element_not_found, action_failed
+
+many recordings with assertions and login handling: ./suite.py --help
 
 exit code:  0 all runs passed   1 a step failed   2 phone or uiautomator2 unreachable, bad recording or name
 """
-
-
-def _spread(values, unit):
-    return {f"min_{unit}": min(values), f"median_{unit}": statistics.median(values), f"max_{unit}": max(values)}
-
-
-def _timings(results):
-    """Whole-run and per-step timings over the runs that got that far (a failed run stops early)."""
-    ran = [r for r in results if r.get("steps")]
-    steps = []
-    for i in range(max((len(r["steps"]) for r in ran), default=0)):
-        hits = [r["steps"][i] for r in ran if len(r["steps"]) > i]
-        steps.append({"step": i + 1, "label": hits[0]["label"], "runs": len(hits),
-                      **_spread([h["ms"] for h in hits], "ms"),
-                      "retries": sum(h["retries"] for h in hits),
-                      "failed": sum(h["status"] == "fail" for h in hits)})
-    total = _spread([r["duration_s"] for r in ran], "s") if ran else {}
-    return total, steps
-
-
-def _pick_serial(args):
-    """Use the only attached phone when --serial is not given. False when several are attached."""
-    if args.serial:
-        return True
-    from adb import list_devices
-    devices = list_devices()
-    if len(devices) == 1:
-        args.serial = devices[0]
-        import config
-        config.ARGS.serial = args.serial   # adb() reads the serial from here
-    elif devices:
-        print("several phones attached, pass --serial: " + ", ".join(devices))
-        return False
-    return True
 
 
 def _dump(args):
@@ -85,7 +55,7 @@ def _dump(args):
     selectors that can be pasted into actions.json. Read-only, nothing is tapped."""
     from failure_bundle import _FOCUS_RE, _screen
     from utils import adb_shell
-    if not _pick_serial(args):
+    if not engine.pick_serial(args):
         return 2
     try:
         import uiautomator2 as u2
@@ -104,112 +74,6 @@ def _dump(args):
     if not screen["clickable"]:
         print("  (none found)")
     return 0
-
-
-def _print_list(items, folder=False):
-    """Recordings, newest first. folder=True shows the folder name, which is what to type when
-    several recordings share a name."""
-    for i in items:
-        label = os.path.basename(i["path"]) if folder else i["name"]
-        when = i["recorded_at"][:16].replace("T", " ")
-        net = "  network" if i["has_network"] else ""
-        print(f"  {label:<44} {when}  {i['action_count']:>3} steps{net}")
-    if not items:
-        print("  (none)")
-
-
-def _resolve(query):
-    """Recording path for a path, "latest", or part of a name. When that is not exactly one
-    recording, prints the choices and returns None."""
-    from recording import Recording
-    if os.path.exists(query):
-        return query
-    items = Recording.list_all()
-    if query == "latest" and items:
-        return items[0]["path"]
-    q = query.lower()
-    hits = [i for i in items if q in os.path.basename(i["path"]).lower() or q in i["name"].lower()]
-    exact = [i for i in hits if query in (i["name"], os.path.basename(i["path"]))]
-    if len(exact) == 1:
-        return exact[0]["path"]
-    if len(hits) == 1:
-        return hits[0]["path"]
-    if hits:
-        print(f"'{query}' matches {len(hits)} recordings, be more specific:")
-        _print_list(hits, folder=True)
-    else:
-        print(f"no recording matches '{query}'. Recordings:")
-        _print_list(items)
-    return None
-
-
-def _package(rec, override):
-    if override:
-        return override
-    return next((a.package for a in rec.actions if a.package), "")
-
-
-def _device_ready(serial):
-    """Wake the screen and check the phone is online. Returns {'battery': n} or None."""
-    from adb import adb, list_devices
-    from utils import adb_shell
-    devices = list_devices()
-    if not devices or (serial and serial not in devices):
-        return None
-    adb("shell", "input", "keyevent", "KEYCODE_WAKEUP")
-    adb("shell", "wm", "dismiss-keyguard")
-    m = re.search(r"level:\s*(\d+)", adb_shell("dumpsys battery", serial))
-    return {"battery": int(m.group(1)) if m else None}
-
-
-def _reset(rec, package, how):
-    import actions
-    actions.force_stop(package)
-    if how == "clear":
-        actions.clear_data(package)
-    if rec.actions and rec.actions[0].type not in ("launch", "launch_deeplink"):
-        actions.launch(package)
-        time.sleep(3)
-
-
-def _run_once(rec, args, run_dir, package, health):
-    from adb import get_device_size
-    from failure_bundle import capture
-    from replayer import ActionReplayer
-
-    os.makedirs(run_dir, exist_ok=True)
-    done, outcome = threading.Event(), {}
-
-    def on_done(success, step, error):
-        outcome.update(success=success, step=step, error=error)
-        done.set()
-
-    log = open(os.path.join(run_dir, "replay.log"), "w")
-
-    def on_status(msg):
-        if not args.quiet:
-            print("  " + msg, flush=True)
-        log.write(msg + "\n")
-
-    rep = ActionReplayer()
-    rep.extra_wait_s = args.wait
-    rep.default_retries = args.retries
-    started = time.time()
-    rep.start(rec, args.mode, args.serial, on_status, on_done, device_resolution=get_device_size())
-    done.wait()
-    log.close()
-
-    result = {"recording": rec.name, "serial": args.serial or "",
-              "success": outcome["success"], "total_steps": len(rec.actions),
-              "battery": health["battery"],
-              "duration_s": round(time.time() - started, 1), "steps": rep.results}
-    if not outcome["success"]:
-        label = rep.results[-1]["label"] if rep.results else ""
-        result["failure"] = capture(os.path.join(run_dir, "failure"), outcome["step"], label,
-                                    outcome["error"], rep.u2_device, args.serial, package)
-    with open(os.path.join(run_dir, "result.json"), "w") as f:
-        json.dump(result, f, indent=2)
-    return result
 
 
 def main():
@@ -252,6 +116,7 @@ def main():
     ap.add_argument("--out", metavar="DIR", help="results folder (default: data/runs/<name>_<time>)")
     args = ap.parse_args()
 
+    from expand import LoadError, load_recording
     from paths import RUNS_DIR
     from recording import Recording, check_actions_file
 
@@ -272,13 +137,20 @@ def main():
         for line in problems:
             print("  - " + line)
         return 2
-    rec = Recording.load(path)
-    package = _package(rec, args.package)
+
+    def load():
+        return load_recording(path)[0]
+
+    try:
+        rec = load()
+    except LoadError as e:
+        print(f"cannot load {path}: {e}")
+        return 2
+    package = engine.package_of(rec, args.package)
     if args.reset and not package:
         print("--reset needs a package: pass --package, or record a launch step")
         return 2
-
-    if not _pick_serial(args):
+    if not engine.pick_serial(args):
         return 2
 
     import actions
@@ -286,7 +158,6 @@ def main():
 
     safe = re.sub(r"[^\w-]+", "_", rec.name).strip("_") or "run"
     out = args.out or str(RUNS_DIR / f"{safe}_{time.strftime('%Y%m%d_%H%M%S')}")
-    os.makedirs(out, exist_ok=True)
 
     net = None
     if args.network:
@@ -296,62 +167,14 @@ def main():
         else:
             print("--network: this recording has no network flows, running against the live backend")
 
-    results = []
-    for n in range(1, args.repeat + 1):
-        if not args.quiet:
-            print(f"run {n}/{args.repeat}: {rec.name}", flush=True)
-        health = _device_ready(args.serial)
-        if health is None:
-            print("  device not reachable")
-            results.append({"success": False, "steps": [], "failure":
-                            {"step": 0, "action": "", "cause": "device_unavailable",
-                             "detail": "no device online"}})
-            break
-        if args.reset:
-            _reset(rec, package, args.reset)
-        if net:
-            net.start({"flows": rec.network_flows, "host_tokens": rec.network_host_tokens})
-        try:
-            result = _run_once(rec, args, os.path.join(out, f"run_{n:02d}"), package, health)
-        finally:
-            if net:
-                net.stop()
-        results.append(result)
-        verdict = "pass" if result["success"] else "FAIL: " + result["failure"]["cause"]
-        if not args.quiet:
-            print(f"  {verdict}  ({result['duration_s']}s)", flush=True)
+    opts = engine.Options(serial=args.serial, mode=args.mode, wait=args.wait,
+                          retries=args.retries, quiet=args.quiet)
+    summary, _ = engine.run_recording(load, opts, out, repeat=args.repeat, package=package,
+                                      reset=args.reset, net=net)
     if net:
         net.shutdown()
-
-    passed = sum(r["success"] for r in results)
-    failed_steps, causes = {}, {}
-    for r in results:
-        f = r.get("failure")
-        if f:
-            key = f"step {f['step']} {f['action']}".strip()
-            failed_steps[key] = failed_steps.get(key, 0) + 1
-            causes[f["cause"]] = causes.get(f["cause"], 0) + 1
-    total, steps = _timings(results)
-    summary = {"recording": rec.name, "runs": len(results), "passed": passed,
-               "failed": len(results) - passed, "flaky": 0 < passed < len(results),
-               "failed_steps": failed_steps, "causes": causes,
-               "total": total, "steps": steps}
-    with open(os.path.join(out, "summary.json"), "w") as f:
-        json.dump(summary, f, indent=2)
-
-    print(f"\n{passed}/{len(results)} passed" + ("  (flaky)" if summary["flaky"] else ""))
-    if steps and not args.quiet:
-        print(f"total {total['min_s']} / {total['median_s']} / {total['max_s']} s  (min / median / max)")
-        for st in steps:
-            print(f"  {st['step']}. {st['label'][:38]:<38} {st['min_ms']:>6} {st['median_ms']:>7.0f} {st['max_ms']:>6} ms")
-    for key, count in failed_steps.items():
-        print(f"  {count}x {key}")
-    for cause, count in causes.items():
-        print(f"  cause {cause}: {count}")
-    print(f"results: {out}")
-    if "device_unavailable" in causes:
-        return 2
-    return 0 if passed == len(results) else 1
+    engine.print_summary(summary, out, args.quiet)
+    return engine.exit_code(summary)
 
 
 if __name__ == "__main__":

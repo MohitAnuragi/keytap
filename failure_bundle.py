@@ -8,6 +8,7 @@ Cause codes (first match wins):
   device_unavailable        phone or uiautomator2 not reachable (infrastructure, not an app bug)
   app_crash                 FATAL EXCEPTION or ANR for the app in the logcat tail
   wrong_app_in_foreground   another app is on screen (launch failed, app closed, a system screen)
+  assertion_failed          an assert step did not hold in time; the error has expected and found
   element_not_found         the element is not on the current screen
   action_failed             anything else
 """
@@ -86,6 +87,8 @@ def classify(error: str, package: str, foreground: dict, logcat: str, reachable:
     if package and fg and fg != package:
         return {"cause": "wrong_app_in_foreground",
                 "detail": f"{fg} is on screen, expected {package}"}
+    if error.startswith("assertion failed"):
+        return {"cause": "assertion_failed", "detail": error}
     if error.startswith("element"):
         return {"cause": "element_not_found",
                 "detail": f"not on the current screen ({foreground.get('activity') or 'unknown screen'})"}

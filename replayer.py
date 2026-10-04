@@ -10,6 +10,8 @@ import threading
 import time
 
 import actions
+import lookup
+from assertions import CHECKS, Context
 from recording import Action, ElementSelector, Recording, action_label
 
 
@@ -27,6 +29,8 @@ class ActionReplayer:
         self._on_status = None
         self._u2_dev = None
         self._u2_error = ""
+        self._serial = None
+        self._warn = ""                 # message of a soft assertion that failed in the current step
         self.extra_wait_s = 10.0        # keep looking this long after the recorded wait
         self._recorded_wait_s = 0.0     # wait still owed for the current step (its gap in the recording)
         self.default_retries = 0        # extra attempts when a step has no retries
@@ -77,6 +81,7 @@ class ActionReplayer:
 
     def _run(self, recording, serial, on_status, on_done, device_resolution):
         self._on_status = on_status
+        self._serial = serial
         actions.set_sync(True)   # each step finishes before the next starts
         total = len(recording.actions)
 
@@ -88,7 +93,7 @@ class ActionReplayer:
 
         # Pre-connect u2 once for the whole replay if any step looks up elements
         self._u2_error = ""
-        if any(a.type in ("element_tap", "scroll_to") for a in recording.actions):
+        if any(a.type in ("element_tap", "scroll_to", "assert") for a in recording.actions):
             try:
                 import uiautomator2 as u2
                 self._u2_dev = u2.connect(serial) if serial else u2.connect()
@@ -131,12 +136,18 @@ class ActionReplayer:
                 on_status(f"[RETRY {attempt}/{retries}] step {i + 1}: {error}")
                 time.sleep(self.RETRY_PAUSE_S)
                 ok, error = self._execute_safe(action, serial)
-            self.results.append({
+            warn, self._warn = self._warn, ""
+            entry = {
                 "step": i + 1, "label": action_label(action),
-                "status": "pass" if ok else "fail",
+                "status": ("warn" if warn else "pass") if ok else "fail",
                 "ms": int((time.time() - started) * 1000),
-                "retries": attempt, "error": error,
-            })
+                "retries": attempt, "error": error or warn or None,
+            }
+            if action.origin:
+                entry["origin"] = action.origin
+            self.results.append(entry)
+            if warn:
+                on_status(f"[WARN] step {i + 1}: {warn}")
             if not ok:
                 on_status(f"[REPLAY ERROR] step {i + 1}: {error}")
                 self.active = False
@@ -175,6 +186,10 @@ class ActionReplayer:
             return self._execute_element_tap(action, serial)
         elif t == "scroll_to":
             return self._execute_scroll_to(action)
+        elif t == "assert":
+            return self._execute_assert(action)
+        elif t == "run":
+            return False, "run step was not expanded (replay it through replay.py or suite.py, inside a suite folder)"
         elif t == "swipe":
             actions.swipe(action.x1, action.y1, action.x2, action.y2,
                           duration=action.duration or 300)
@@ -209,15 +224,53 @@ class ActionReplayer:
     def _describe(sel: ElementSelector) -> str:
         return sel.resource_id or sel.content_desc or sel.text or "?"
 
+    def _budget(self, action: Action):
+        """(recorded wait, total wait) in seconds for element taps and assertions: as long as the
+        user waited in the recording, then extra_wait_s more; timeout_ms replaces both."""
+        if action.timeout_ms:
+            return 0.0, action.timeout_ms / 1000
+        return self._recorded_wait_s, self._recorded_wait_s + self.extra_wait_s
+
+    @staticmethod
+    def _waited(recorded_s: float, timeout_s: float) -> str:
+        return f"{recorded_s:.1f}s recorded + {timeout_s - recorded_s:g}s more" if recorded_s else f"{timeout_s:g}s"
+
+    def _execute_assert(self, action: Action):
+        """Poll the check until it holds or the wait runs out. A soft assertion only warns."""
+        spec = CHECKS.get(action.check)
+        if spec is None:
+            return False, f"unknown check: {action.check}"
+        if self._u2_dev is None:
+            return False, self._unavailable()
+        ctx = Context(self._u2_dev, self._serial)
+        recorded_s, timeout_s = self._budget(action)
+        deadline = time.time() + timeout_s
+        while True:
+            try:
+                ok, actual = spec["fn"](ctx, action)
+            except Exception as e:
+                ok, actual = False, f"check error: {type(e).__name__}: {e}"
+            if ok:
+                return True, None
+            if time.time() >= deadline or self._stop_event.is_set():
+                break
+            time.sleep(0.3)
+        sel = action.selector
+        what = self._describe(sel) if sel else "the screen"
+        msg = f"assertion failed: {action.check} {what}"
+        if action.value is not None:
+            msg += f" {action.value!r}"
+        if actual is not None:
+            msg += f" (found {actual!r})"
+        msg += f" after {self._waited(recorded_s, timeout_s)}"
+        if action.soft:
+            self._warn = msg
+            return True, None
+        return False, msg
+
     def _execute_element_tap(self, action: Action, serial: str):
         sel = action.selector
-        # wait as long as the user waited in the recording, then keep looking for extra_wait_s more;
-        # timeout_ms on the step replaces both with one fixed wait
-        if action.timeout_ms:
-            recorded_s, timeout_s = 0.0, action.timeout_ms / 1000
-        else:
-            recorded_s = self._recorded_wait_s
-            timeout_s = recorded_s + self.extra_wait_s
+        recorded_s, timeout_s = self._budget(action)
         dev = self._u2_dev
         last_exc = None
         if dev is not None:
@@ -240,8 +293,7 @@ class ActionReplayer:
             return False, self._unavailable()
         if last_exc:
             return False, f"element lookup failed: {last_exc}"
-        waited = f"{recorded_s:.1f}s recorded + {timeout_s - recorded_s:g}s more" if recorded_s else f"{timeout_s:g}s"
-        return False, f"element '{self._describe(sel)}' not found after {waited}"
+        return False, f"element '{self._describe(sel)}' not found after {self._waited(recorded_s, timeout_s)}"
 
     def _execute_scroll_to(self, action: Action):
         """Swipe until the element is on screen. Does not tap it."""
@@ -302,24 +354,4 @@ class ActionReplayer:
         return None, last_exc
 
     def _find_element(self, dev, selector: ElementSelector):
-        """Try selector fields in priority order. Returns u2 UiObject or None.
-        The recorded index applies to the first identifier set, the one it was counted for."""
-        checks = [
-            ("resourceId", selector.resource_id),
-            ("description", selector.content_desc),
-            ("text", selector.text),
-        ]
-        primary = next((k for k, v in checks if v), None)
-        for key, value in checks:
-            if not value:
-                continue
-            kwargs = {key: value}
-            if key == primary and selector.index:
-                kwargs["instance"] = selector.index
-            try:
-                el = dev(**kwargs)
-                if el.exists:
-                    return el
-            except Exception:
-                continue
-        return None
+        return lookup.find_element(dev, selector)

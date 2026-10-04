@@ -30,7 +30,7 @@ class ElementSelector:
 @dataclass
 class Action:
     t: int           # ms since recording start
-    type: str        # tap | element_tap | scroll_to | swipe | input_text | launch | launch_deeplink | keyevent | wait | force_stop | clear_data | permission | dev_option
+    type: str        # tap | element_tap | scroll_to | assert | run | swipe | input_text | launch | launch_deeplink | keyevent | wait | force_stop | clear_data | permission | dev_option
     # tap
     x: Optional[int] = None
     y: Optional[int] = None
@@ -61,6 +61,16 @@ class Action:
     timeout_ms: Optional[int] = None
     retries: Optional[int] = None
     direction: Optional[str] = None
+    # assert step: check name (see assertions.py), value to compare, soft = warn instead of fail
+    check: Optional[str] = None
+    value: Optional[str] = None
+    soft: Optional[bool] = None
+    # run step (expanded before replay, see expand.py): flow folder and its params
+    flow: Optional[str] = None
+    params: Optional[dict] = None
+    # set while loading: secret input is masked in logs; origin names the flow step it came from
+    secret: Optional[bool] = None
+    origin: Optional[str] = None
 
     def to_dict(self):
         d = asdict(self)
@@ -205,6 +215,9 @@ class Recording:
                 timeout_ms=a.get("timeout_ms"),
                 retries=a.get("retries"),
                 direction=a.get("direction"),
+                check=a.get("check"), value=a.get("value"), soft=a.get("soft"),
+                flow=a.get("flow"), params=a.get("params"),
+                secret=a.get("secret"), origin=a.get("origin"),
             ))
         return actions
 
@@ -264,12 +277,21 @@ def action_label(action: "Action") -> str:
         if name and "/" in name:
             name = name.split("/")[-1]
         return f"scroll_to: {name or '?'} ({action.direction or 'down'})"
+    elif t == "assert":
+        sel = action.selector
+        name = (sel and (sel.resource_id or sel.content_desc or sel.text)) or ""
+        if "/" in name:
+            name = name.split("/")[-1]
+        value = f" {action.value!r}" if action.value is not None else ""
+        return f"assert {action.check} {name}{value}".replace("  ", " ").strip()
+    elif t == "run":
+        return f"run: {action.flow}"
     elif t == "tap":
         return f"tap ({action.x}, {action.y})"
     elif t == "swipe":
         return f"swipe ({action.x1},{action.y1})->({action.x2},{action.y2})"
     elif t == "input_text":
-        preview = repr((action.text or "")[:20])
+        preview = "***" if action.secret else repr((action.text or "")[:20])
         return f"input_text: {preview}"
     elif t == "launch":
         pkg = (action.package or "").split(".")[-1]
@@ -306,6 +328,8 @@ _REQUIRED = {
     "wait":            ("duration",),
     "element_tap":     ("selector",),
     "scroll_to":       ("selector",),
+    "assert":          ("check",),
+    "run":             ("flow",),
     "permission":      ("package", "permission", "state"),
     "dev_option":      ("label", "state"),
 }
@@ -355,7 +379,18 @@ def check_actions_file(path: str) -> List[str]:
                 problems.append(f'{where} ({typ}): needs "{field_name}"')
         if typ == "permission" and a.get("state") not in (None, "GRANTED", "DENIED"):
             problems.append(f'{where} (permission): "state" must be "GRANTED" or "DENIED"')
-        if typ in ("element_tap", "scroll_to") and isinstance(a.get("selector"), dict):
+        if typ == "assert" and a.get("check"):
+            from assertions import CHECKS
+            spec = CHECKS.get(a["check"])
+            if spec is None:
+                problems.append(f'{where}: unknown check "{a["check"]}" (use one of: {", ".join(sorted(CHECKS))})')
+            else:
+                for field_name in spec["needs"]:
+                    if a.get(field_name) in (None, "", {}):
+                        problems.append(f'{where} (assert {a["check"]}): needs "{field_name}"')
+        if typ == "run" and a.get("params") is not None and not isinstance(a["params"], dict):
+            problems.append(f'{where} (run): "params" must be an object')
+        if typ in ("element_tap", "scroll_to", "assert") and isinstance(a.get("selector"), dict):
             sel = a["selector"]
             extra = set(sel) - _SELECTOR_KEYS
             if extra:
@@ -367,7 +402,7 @@ def check_actions_file(path: str) -> List[str]:
             if not (sel.get("resource_id") or sel.get("content_desc") or sel.get("text")) and not has_fallback:
                 hint = ' (or "fallback_coords": [x, y] to tap by position)' if typ == "element_tap" else ""
                 problems.append(f"{where}: selector needs resource_id, content_desc or text{hint}")
-        elif typ in ("element_tap", "scroll_to") and a.get("selector") is not None:
+        elif typ in ("element_tap", "scroll_to", "assert") and a.get("selector") is not None:
             problems.append(f'{where}: "selector" must be an object')
         for opt in ("timeout_ms", "retries"):
             if opt in a and not _is_count(a[opt]):

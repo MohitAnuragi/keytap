@@ -18,6 +18,9 @@ KEYTAP = the folder that contains `replay.py`: the current folder if `./replay.p
 ./replay.py --dump                         what is on the phone's screen now, read-only
 ./replay.py <name> --repeat 5 --quiet      run it 5 times, final summary only
 /opt/homebrew/bin/python3 recording.py --check <actions.json>    validate an edit
+./suite.py run <suite> <test> --repeat 5 --quiet   a test inside a suite folder (suite.json), with login handling
+./suite.py check <suite>                   validate every file, warn about fragile steps
+./suite.py checks                          the assertions you can use
 ```
 
 Exit code of `replay.py`: 0 all passed, 1 a step failed, 2 phone or uiautomator2 unreachable or bad name. Always pass `--quiet`. Details of the files and fields are in `reference/`.
@@ -55,11 +58,25 @@ Step numbers in `failed_steps` ("step 3 ...") are 1-based positions in `actions`
 | Target is off screen in a list | Insert a `scroll_to` step (same selector, `direction`) before the tap |
 | A coordinate `tap` | Open that screen, run `./replay.py --dump`, replace it with an `element_tap` using the selector it prints |
 | `wrong_app_in_foreground` | Read `foreground`. A launch, dialog or permission prompt got in the way. Report it, and add a step only if the user agrees |
+| `assertion_failed` | Read `found` in `error`. Wrong expectation (changed or dynamic text): fix the assertion. Too early: `timeout_ms` on it. A real bug: report it, do not weaken the assertion |
+| `login_failed` | The suite's login flow fails, not the test. Harden `flows/login` the same way, then re-run |
+| `load_error` | A file problem: missing flow, a `{{env:NAME}}` that is not set, a loop of `run` steps. Fix the file or tell the user which variable to set |
 | `app_crash` | Not a recording problem. Report it with the `logcat.txt` lines. Edit nothing |
 | `device_unavailable` | Infrastructure. Stop and report |
 | `action_failed` | Read `error`. Usually a bad edit or an adb problem |
 
 Selector rules: prefer `resource_id`, then `content_desc`, then `text`. Never use `text` that changes (names, counts, times, balances). `resource_id` is the full `pkg:id/name`. Replay tries `resource_id` first and taps the first match, so to use `content_desc` the `resource_id` must be empty. Keep `t` non-decreasing when inserting steps.
+
+## Suites and assertions
+
+A suite folder holds `flows/` (reusable, a test includes one with a `run` step) and `tests/` (one folder each, with an `actions.json`). Harden a test there with `./suite.py run <suite> <test> --repeat 5 --quiet`; results are in `<suite>/.runs/<time>/<test>/` and the layout is the same as for `replay.py`. Login is handled by the runner per the test's `login` header (once, always, never), not by the test.
+
+Add assertions so a pass means the result is right, not only that every step ran:
+1. Run the test once. It ends on the screen that shows the result, so run `./replay.py --dump` and pick an element that proves the outcome.
+2. Add an `assert` step after the step that causes it. `./suite.py checks` lists the checks (`visible`, `gone`, `text_equals`, `text_contains`, `enabled`, `disabled`, `count`, `screen`). Prefer `visible` on a stable id. For text, make it unique with `{{ts}}` in both the `input_text` and the assertion's `value`, or old data satisfies it.
+3. Prove it can fail: run once with a wrong `value`, see `assertion_failed`, then put the right one back.
+4. Do not assert on text that changes (balances, times, counts, names). Start a new assertion with `"soft": true` if unsure, and tighten it after it passes 10 of 10.
+5. Credentials go in `{{env:NAME}}`, never in a file. Ask the user which variable holds each secret.
 
 ## Done
 

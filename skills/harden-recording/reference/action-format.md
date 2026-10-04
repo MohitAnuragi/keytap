@@ -16,6 +16,8 @@ Top level: `{"name", "recorded_at", "serial", "device_resolution", "actions": [.
 | `permission` | `package`, `permission` (full name or `*`), `state` (`GRANTED` or `DENIED`) |
 | `dev_option` | `label`, `state` |
 | `wait` | `duration` (ms) |
+| `assert` | `check`, `selector` and `value` as the check needs, `timeout_ms`, `soft`. Waits until the check holds, like an element tap. `soft: true` only warns. `./suite.py checks` lists the checks and what each needs |
+| `run` | `flow` (folder relative to the suite, for example `flows/login`), `params`. Expanded before the replay, so a failure names the flow step: `login step 4 <- send_message step 1`. Needs a suite folder; flows may nest 3 deep |
 
 ## selector
 
@@ -38,3 +40,13 @@ Top level: `{"name", "recorded_at", "serial", "device_resolution", "actions": [.
 `./replay.py` defaults to `--mode timed`: the pauses of the recording are slept first (each capped at 10s). `--mode fast` uses 0.3s between steps.
 
 Validate any edit with `recording.py --check <actions.json>`. `replay.py` also validates before it runs.
+
+## Placeholders (in any string of an action)
+
+- `{{name}}`: a param from the `run` step (or the test's `login_params`).
+- `{{ts}}`: a timestamp, the same for the whole run and different for every run. Use it for unique text.
+- `{{env:NAME}}`: an environment variable. An `input_text` that used one is shown as `***` in logs. A missing variable is a `load_error`.
+
+## Test header (top level of a test's actions.json)
+
+`tags`, `description`, `login` (`once`, `always` or `never`), `login_params`, `before_each` (`restart` or `none`).

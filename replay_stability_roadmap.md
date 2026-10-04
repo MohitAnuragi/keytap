@@ -181,6 +181,30 @@ Fix network matching before relying on it for smoke assertions. Wrong mocks look
 7. Richer selectors and scroll-to-element.
 8. A Claude skill that runs the bake loop, proposes ignore rules and selector fixes, and promotes a recording to "stable" only after N consecutive passes. Pass or fail stays deterministic. An LLM is never the judge in CI.
 
+## Test suites (shipped)
+
+Recordings as a test suite: `./suite.py --help`. A suite is a committed folder next to the app, so other developers can run it.
+
+```
+keytap-tests/
+  suite.json                 package, login, before_each, tests, defaults
+  flows/login/actions.json   reusable; a test includes it with {"type": "run", "flow": "flows/login"}
+  tests/send_message/actions.json
+  .runs/<time>/              results: summary.json, junit.xml, failures/<test>.png, <test>/run_NN/...
+```
+
+- **Commands:** `init`, `add <dir> <recording> --as test|flow` (copies only actions.json, no network, video or timeline), `check` (validates, follows `run` steps, lints), `run [test ...] [--tag] [--login] [--repeat]`, `show [run]`, `checks`.
+- **Assertions** (`assert` step): `visible`, `gone`, `text_equals`, `text_contains`, `enabled`, `disabled`, `count`, `screen`. They wait until true (recorded wait plus extra, or `timeout_ms`), fail with expected and found, cause `assertion_failed`; `soft: true` only warns. A run also fails with `app_crash` when logcat shows a crash during it (implicit check).
+- **Adding a check is one function** in `assertions.py` with `@check("name", needs=(...))` returning `(ok, actual)`. The validator, `suite.py checks`, help and the skill read the registry. Waiting, timeouts, soft, messages and the failure bundle are generic.
+- **`run` steps and placeholders** (`expand.py`): flows are folders, expanded before the replay with params, `{{ts}}` (unique per run) and `{{env:NAME}}` (secrets stay out of files, shown as `***` in logs). Loops and nesting beyond 3 are errors. A failing step names its origin: `login step 4 <- send_message step 1`.
+- **Login policy per test** (header `login`, or `login.default` in suite.json, or `--login`): `once` logs in only when needed (a `login.check` selector visible only when logged in; waits `check_timeout`, default 20s), `always` wipes the app's data and logs in, `never` does nothing. Tests run in the order listed (alphabetical for a glob). After a failed test the login state is unknown and is verified or redone for the next one.
+- **Screenshot on failure:** each failed test's screenshot is copied to `failures/<test>.png`, listed in `summary.json`, and attached in `junit.xml` (`[[ATTACHMENT|path]]`). The full failure bundle stays in `<test>/run_NN/failure/`. A failed login does the same.
+- **Code layout:** `engine.py` runs recordings (shared by `replay.py` and `suite.py`), `lookup.py` finds elements, `assertions.py`, `expand.py`, `suite.py`.
+- **Tested with a fake app and phone only** (login screen, home screen, session that survives a restart). Not yet run on a real phone: assertions against real screens, the login `check`, `clear_data` between tests, and the 3s settle after a restart.
+- **Known limits:** `gone` passes at once if the element never appeared; `launch` is not confirmed by the app; tests share one phone and one account, so run one suite at a time; a flow that needs an OTP cannot be automated yet.
+
+---
+
 ## Claude skill for hardening a recording (written)
 
 Lives in `skills/harden-recording/` (`SKILL.md` plus `reference/action-format.md` and `reference/failure-causes.md`). `bash install.sh` (or `bash install.sh --skill-only`) copies it to `~/.claude/skills/harden-recording/` and writes this keytap folder's path into it, so it works when Claude is not started inside the keytap folder. Edit the copy in the repo, then re-run `--skill-only`.
