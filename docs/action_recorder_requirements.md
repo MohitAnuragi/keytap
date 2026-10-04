@@ -160,15 +160,15 @@ On replay, each `element_tap` does a fresh u2 hierarchy dump to find the current
 ## Architecture
 
 New files:
-- `recorder.py` — `ActionRecorder` class: start/stop recording, event ingestion, save to disk
-- `replayer.py` — `ActionReplayer` class: load recording, execute actions with mode/delay logic
-- `recording.py` — dataclasses: `Recording`, `Action`, `ElementSelector`
+- `keytap/recorder/recorder.py` — `ActionRecorder` class: start/stop recording, event ingestion, save to disk
+- `keytap/recorder/replayer.py` — `ActionReplayer` class: load recording, execute actions with mode/delay logic
+- `keytap/recorder/recording.py` — dataclasses: `Recording`, `Action`, `ElementSelector`
 
 Modified files:
-- `actions.py` — emit events to `ActionRecorder` if recording active (observer hook)
-- `element_manager.py` — emit `element_tap` events with full selector on label tap
-- `palette_proc.py` — add "Action Recorder" top-level entry; show `[STOP RECORDING]` pin when recording; replay mode file picker + mode selector
-- `app.py` — hold `ActionRecorder` and `ActionReplayer` instances; wire palette results
+- `keytap/device/actions.py` — emit events to `ActionRecorder` if recording active (observer hook)
+- `keytap/ui/element_manager.py` — emit `element_tap` events with full selector on label tap
+- `keytap/ui/palette_proc.py` — add "Action Recorder" top-level entry; show `[STOP RECORDING]` pin when recording; replay mode file picker + mode selector
+- `keytap/ui/app.py` — hold `ActionRecorder` and `ActionReplayer` instances; wire palette results
 
 ---
 

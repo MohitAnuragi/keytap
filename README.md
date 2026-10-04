@@ -119,6 +119,27 @@ keytap --backend screenrecord   # fallback capture
 
 ---
 
+## Code layout
+
+```
+keytap.py  replay.py  suite.py     commands, thin wrappers (run them from the keytap folder)
+install.sh  bootstrap.sh           install and one-liner setup
+docs/                              roadmaps and design notes
+skills/                            the harden-recording Claude skill (install.sh copies it to ~/.claude)
+data/  suites/                     your recordings, traces, heap dumps and test suites (gitignored)
+keytap/                            the Python package
+  core/       config, paths, settings, utils, fonts
+  device/     adb, actions, screen capture, logcat, element lookup
+  recorder/   recording format, recorder, replayer, network capture and replay, timeline
+  runner/     headless engine, run steps and placeholders, assertions, failure bundles
+  profiler/   perf traces, heap snapshots, HPROF parsing and analysis
+  inspectors/ permissions, developer options, shared prefs, remote config, memory
+  ui/         the window, palette, element overlay, themes, timeline viewer
+  cli/        the replay and suite commands
+```
+
+Modules start each other with `python -m keytap.<package>.<module>` (see `keytap/core/paths.py`), so run everything from the repo folder or through the wrappers.
+
 ## License
 
 MIT

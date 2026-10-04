@@ -17,7 +17,7 @@ KEYTAP = the folder that contains `replay.py`: the current folder if `./replay.p
 ./replay.py --list                         recordings (name, date, steps)
 ./replay.py --dump                         what is on the phone's screen now, read-only
 ./replay.py <name> --repeat 5 --quiet      run it 5 times, final summary only
-/opt/homebrew/bin/python3 recording.py --check <actions.json>    validate an edit
+/opt/homebrew/bin/python3 -m keytap.recorder.recording --check <actions.json>    validate an edit
 ./suite.py run <suite> <test> --repeat 5 --quiet   a test inside a suite folder (suite.json), with login handling
 ./suite.py check <suite>                   validate every file, warn about fragile steps
 ./suite.py checks                          the assertions you can use
@@ -31,7 +31,7 @@ Exit code of `replay.py`: 0 all passed, 1 a step failed, 2 phone or uiautomator2
 2. Ask before anything that changes the phone beyond tapping the app: `--reset clear`, `clear_data`, `permission` or `dev_option` steps, anything in Settings. Do not change phone settings to make a run pass.
 3. Make a working copy, never edit the original:
    `cp -R data/recordings/<folder> data/recordings/<name>_v2`, then set `"name": "<name>_v2"` in the copy's `actions.json`. Next round `_v3`, and so on.
-4. Validate the copy with `recording.py --check`.
+4. Validate the copy with `python3 -m keytap.recorder.recording --check`.
 
 ## The loop (at most 5 rounds)
 

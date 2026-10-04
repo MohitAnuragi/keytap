@@ -39,7 +39,7 @@ Top level: `{"name", "recorded_at", "serial", "device_resolution", "actions": [.
 
 `./replay.py` defaults to `--mode timed`: the pauses of the recording are slept first (each capped at 10s). `--mode fast` uses 0.3s between steps.
 
-Validate any edit with `recording.py --check <actions.json>`. `replay.py` also validates before it runs.
+Validate any edit with `python3 -m keytap.recorder.recording --check <actions.json>` (from the keytap folder). `replay.py` also validates before it runs.
 
 ## Placeholders (in any string of an action)
 

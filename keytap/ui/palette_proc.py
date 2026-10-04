@@ -1,0 +1,2325 @@
+"""
+Palette subprocess: native macOS tkinter window.
+Reads one JSON line from stdin, writes one JSON line to stdout on close.
+
+Input JSON keys:
+  mode      : "palette" | "viewer"
+  packages  : [str, ...]          (palette mode)
+  clipboard : str                 (palette mode)
+  deeplinks : [str, ...]          (palette mode)
+  serial    : str | null          (palette mode)
+  title     : str                 (viewer mode)
+  items     : [[key,val], ...]    (viewer mode - key/value pairs)
+
+Output JSON:
+  null                            cancelled
+  {"type": "launch",        "pkg": str}
+  {"type": "force-stop",    "pkg": str}
+  {"type": "clear-data",    "pkg": str}
+  {"type": "uninstall",     "pkg": str}
+  {"type": "app-action",    "pkg": str, "action": str}
+  {"type": "input-text",    "text": str}
+  {"type": "view-hierarchy"}
+  {"type": "memory"}
+  {"type": "install-apk"}
+  {"type": "dev-options"}
+  {"type": "clipboard"}
+  {"type": "deeplink",      "value": str}
+"""
+import collections
+import json
+import logging
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import tkinter as tk
+import tkinter.filedialog as filedialog
+
+from keytap.core.paths import LOG_FILE, ROOT, child_env, module_command
+
+_LOG_FILE = str(LOG_FILE)
+_log = logging.getLogger("keytap.palette")
+
+# ── Feature flags ─────────────────────────────────────────────────────────────
+
+SHOW_MEMORY = False   # disabled until memory inspector is fully implemented
+
+# ── Colors (defaults; overridden by active theme at PaletteWindow init) ────────
+
+C = {
+    'bg':      '#1c1c1e',
+    'bg2':     '#2c2c2e',
+    'fg':      '#f0f0f0',
+    'dim':     '#888888',
+    'accent':  '#00c864',
+    'sel':     '#3a3a3c',
+    'sel_fg':  '#00c864',
+    'border':  '#3a3a3c',
+}
+
+FONT_MONO  = ("Menlo", 13)
+FONT_SMALL = ("Menlo", 11)
+
+# ── Built-in commands ─────────────────────────────────────────────────────────
+
+BUILT_IN = [
+    ("  View Hierarchy    – browse UI tree",      "view-hierarchy"),
+    *([("  Memory Watchdog   – live RAM stats",   "memory")] if SHOW_MEMORY else []),
+    ("  Input Text        – send to device",      "input-text"),
+    ("  Dev Options       – toggle ADB settings", "dev-options"),
+    ("  Install APK       – install from file",   "install-apk"),
+    ("  Theme             – switch color theme",  "theme-switcher"),
+    ("  Capture Settings  – stream quality",        "capture-settings"),
+    ("  Action Recorder   – record & replay flows", "action-recorder"),
+    ("  Perf Trace        – record & analyze jank",  "perf-trace"),
+    ("  Memory Profiler   – heap snapshots & leaks", "memory-profiler"),
+]
+
+_BITRATE_PRESETS = [
+    ("2 Mbps  – lowest lag",       "2000000"),
+    ("4 Mbps  – low quality",      "4000000"),
+    ("8 Mbps  – medium quality",   "8000000"),
+    ("16 Mbps – good quality",     "16000000"),
+    ("20 Mbps – default",          "20000000"),
+    ("40 Mbps – maximum quality",  "40000000"),
+]
+
+_FPS_PRESETS = [
+    ("Off  – native device fps",        0),
+    ("15 fps  – low bandwidth",         15),
+    ("24 fps  – film-like",             24),
+    ("30 fps  – balanced (recommended)", 30),
+]
+
+_ENCODE_SCALE_PRESETS = [
+    ("100%  – native (default)",         1.0),
+    ("75%   – smaller I-frames",         0.75),
+    ("50%   – half res, ~4x less stall", 0.5),
+    ("25%   – thumbnail quality",        0.25),
+]
+
+APP_ACTIONS = [
+    ("  Launch",        "launch"),
+    ("  Force Stop",    "force-stop"),
+    ("  Clear Data",    "clear-data"),
+    ("  Uninstall",     "uninstall"),
+    ("  Shared Prefs",  "shared-prefs"),
+    ("  Remote Config", "remote-config"),
+    ("  Litmus",        "litmus"),
+    ("  Permissions",   "permissions"),
+]
+
+_DEEPLINK_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9+\-.]*://.+')
+
+
+# ── Palette window ────────────────────────────────────────────────────────────
+
+class PaletteWindow:
+    W, H = 540, 480
+
+    def __init__(self, root, data):
+        self.root    = root
+        self.data    = data
+        self.result  = None
+        self.state   = "search"    # search | actions | input | viewer | hierarchy
+        self.sel_pkg = None
+
+        self._adb_path = data.get("adb_path", "adb")
+        self._serial   = data.get("serial") or None
+
+        # Apply active theme to C before building UI
+        try:
+            from keytap.ui import theme_manager
+            t = theme_manager.get_active_theme()
+            C.update({
+                'bg':     t['bg'],
+                'bg2':    t['bg_input'],
+                'fg':     t['fg'],
+                'dim':    t['fg_dim'],
+                'accent': t['accent'],
+                'sel':    t['sel_bg'],
+                'sel_fg': t['accent'],
+                'border': t['grid_line'],
+            })
+        except Exception:
+            pass
+
+        # viewer state
+        self._viewer_all          = []   # all formatted display strings (unfiltered)
+        self._viewer_raw_items    = []   # raw (label, state) pairs, parallel to _viewer_all
+        self._viewer_shown_idx    = []   # _viewer_all index for each listbox row (after filter)
+        self._viewer_on_enter     = None # callable(raw_idx) or None for read-only viewers
+        self._viewer_on_back      = None # callable() for Esc one level up, None = back to search
+
+        # perf trace state
+        self._trace_path   = None
+        self._trace_frames = []
+        self._trace_warns  = []
+        self._trace_sort   = "dur"       # dur | time
+
+        # memory profiler state
+        self._heap_meta    = None        # sidecar dict of the open snapshot
+        self._heap_rows    = []          # class rows (or diff rows when _heap_old is set)
+        self._heap_warns   = []
+        self._heap_old     = None        # older snapshot meta while viewing a diff
+        self._heap_sort    = "retained"  # retained | shallow | cnt
+        self._heap_own     = True        # only classes under the app's package prefix
+        self._viewer_search = None       # (on_enter, fn(query)): viewer-specific search
+
+        self._dump = None                # running snapshot capture, see _start_dump
+
+        # detail snapshot (HPROF) state
+        self._hp_meta = None
+        self._hp_data = None
+        self._hp_bitmap_sort = "size"    # size | ratio
+
+        # actions state
+        self._action_items       = []   # set by _enter_actions; init here avoids trace race
+
+        # input context: distinguishes what the input state is collecting
+        self._input_context = "input-text"
+
+        # replay: holds selected recording info between viewer transitions
+        self._selected_recording = None
+        self._manage_recording   = None
+
+        # hierarchy state
+        self._hier_nav_stack     = []   # [(nodes, label), ...]
+        self._hier_current_nodes = []
+        self._hier_current_label = "root"
+        self._hier_all_flat      = []
+        self._hier_shown         = []
+
+        # ── Packages + built-ins ──────────────────────────────────────────────
+        self._pkgs = data.get("packages", [])
+        self._deeplinks = data.get("deeplinks", [])
+        self._clipboard = data.get("clipboard", "")
+
+        # Build full item list: (display, type, value)
+        self._all_items = []
+        for label, vtype in BUILT_IN:
+            self._all_items.append((label, vtype, None))
+        # Clipboard
+        clip = self._clipboard.strip()
+        if clip:
+            short = clip[:60] + ("..." if len(clip) > 60 else "")
+            self._all_items.append((f"  Clipboard        – {short}", "clipboard", clip))
+        # Deeplinks
+        for dl in self._deeplinks:
+            short = dl[:60] + ("..." if len(dl) > 60 else "")
+            self._all_items.append((f"  Deeplink         – {short}", "deeplink", dl))
+        # Packages
+        for pkg in self._pkgs:
+            self._all_items.append((f"  {pkg}", "pkg", pkg))
+
+        self._shown = list(self._all_items)
+
+        # Pin [STOP RECORDING] at top while a recording is active.
+        if data.get("recording_active"):
+            self._all_items.insert(0, ("  [STOP RECORDING]", "stop-recording", None))
+            self._shown = list(self._all_items)
+        if data.get("trace_active"):
+            self._all_items.insert(0, ("  [STOP TRACE]", "stop-trace", None))
+            self._shown = list(self._all_items)
+
+        # ── Build UI ──────────────────────────────────────────────────────────
+        root.title("keytap")
+        root.geometry(f"{self.W}x{self.H}")
+        root.configure(bg=C['bg'])
+        root.resizable(True, True)
+        root.attributes("-topmost", True)
+
+        # Search bar frame
+        bar_frame = tk.Frame(root, bg=C['bg2'], pady=0)
+        bar_frame.pack(fill="x", padx=0, pady=0)
+
+        self._prompt = tk.Label(bar_frame, text=">", bg=C['bg2'], fg=C['accent'],
+                                font=FONT_MONO, padx=8, pady=10)
+        self._prompt.pack(side="left")
+
+        self._var = tk.StringVar()
+        self._entry = tk.Entry(bar_frame, textvariable=self._var,
+                               bg=C['bg2'], fg=C['fg'],
+                               insertbackground=C['fg'],
+                               font=FONT_MONO, relief="flat", bd=0)
+        self._entry.pack(side="left", fill="x", expand=True, pady=10, padx=(0, 8))
+        self._entry.focus_set()
+
+        # Separator
+        tk.Frame(root, bg=C['border'], height=1).pack(fill="x")
+
+        # List
+        list_frame = tk.Frame(root, bg=C['bg'])
+        list_frame.pack(fill="both", expand=True, padx=0, pady=0)
+
+        scrollbar = tk.Scrollbar(list_frame, orient="vertical", bg=C['bg'],
+                                 troughcolor=C['bg'], width=6)
+        self._lb = tk.Listbox(list_frame, bg=C['bg'], fg=C['fg'],
+                              selectbackground=C['sel'], selectforeground=C['sel_fg'],
+                              font=FONT_MONO, relief="flat", bd=0,
+                              activestyle="none", highlightthickness=0,
+                              yscrollcommand=scrollbar.set)
+        scrollbar.config(command=self._lb.yview)
+        scrollbar.pack(side="right", fill="y")
+        self._lb.pack(fill="both", expand=True)
+
+        # Footer
+        tk.Frame(root, bg=C['border'], height=1).pack(fill="x")
+        self._footer = tk.Label(root, text="↑↓=move  Enter=select  Esc=close",
+                                bg=C['bg2'], fg=C['dim'],
+                                font=FONT_SMALL, anchor="w", padx=12, pady=6)
+        self._footer.pack(fill="x")
+
+        # Populate list
+        self._refresh_search()
+
+        # ── Bindings ──────────────────────────────────────────────────────────
+        self._var.trace_add("write", self._on_type)
+        # Bind Up/Down on entry to stop event reaching root (macOS fires both)
+        self._entry.bind("<Up>",   self._on_up)
+        self._entry.bind("<Down>", self._on_down)
+        self._lb.bind("<<ListboxSelect>>", self._on_lb_select)
+        root.bind("<Return>",        self._on_enter)
+        root.bind("<Escape>",        self._on_escape)
+        root.bind("<Command-r>",     self._on_refresh)
+        root.bind("<Command-s>",     self._on_sort)
+        root.bind("<Command-o>",     self._on_toggle_own)
+        root.bind("<Command-d>",     self._on_diff)
+        root.bind("<Command-i>",     self._on_inspect)
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Select first item
+        if self._lb.size() > 0:
+            self._lb.selection_set(0)
+            self._lb.activate(0)
+
+    # ── List management ───────────────────────────────────────────────────────
+
+    def _set_items(self, items):
+        self._lb.delete(0, "end")
+        for label, *_ in items:
+            self._lb.insert("end", label)
+        if items:
+            self._lb.selection_set(0)
+            self._lb.activate(0)
+
+    def _selected_idx(self):
+        sel = self._lb.curselection()
+        return sel[0] if sel else None
+
+    def _move(self, delta):
+        idx = self._selected_idx()
+        if idx is None:
+            idx = 0
+        else:
+            idx = max(0, min(self._lb.size() - 1, idx + delta))
+        self._lb.selection_clear(0, "end")
+        self._lb.selection_set(idx)
+        self._lb.activate(idx)
+        self._lb.see(idx)
+        if self.state == "hierarchy":
+            self._send_hover_at(idx)
+
+    # ── Search state ──────────────────────────────────────────────────────────
+
+    def _on_type(self, *_):
+        if self.state == "search":
+            self._refresh_search()
+        elif self.state == "actions":
+            self._refresh_actions()
+        elif self.state == "input":
+            pass  # raw text, no filtering
+        elif self.state == "viewer":
+            self._refresh_viewer()
+        elif self.state == "hierarchy":
+            self._filter_hierarchy(self._var.get())
+
+    def _refresh_search(self):
+        q = self._var.get().lower().strip()
+        # Check if it looks like a deeplink being typed
+        if _DEEPLINK_RE.match(self._var.get()):
+            self._shown = [("  Send deeplink: " + self._var.get(), "deeplink-new", self._var.get())]
+        elif q:
+            self._shown = [(l, t, v) for (l, t, v) in self._all_items if q in l.lower()]
+        else:
+            self._shown = list(self._all_items)
+        self._set_items(self._shown)
+        self._footer.config(
+            text=f"{len(self._shown)} results  |  ↑↓=move  Enter=select  Esc=close"
+        )
+
+    def _refresh_actions(self):
+        q = self._var.get().lower().strip()
+        if q:
+            self._shown = [(l, t, v) for (l, t, v) in self._action_items if q in l.lower()]
+        else:
+            self._shown = list(self._action_items)
+        self._set_items(self._shown)
+
+    # ── Events ────────────────────────────────────────────────────────────────
+
+    def _on_enter(self, _=None):
+        idx = self._selected_idx()
+        if idx is None:
+            return
+        if self.state == "search":
+            label, vtype, vvalue = self._shown[idx]
+            if vtype == "pkg":
+                self._enter_actions(vvalue)
+            elif vtype == "input-text":
+                self._enter_input()
+            elif vtype == "clipboard":
+                self._emit({"type": "clipboard", "value": vvalue})
+            elif vtype == "deeplink":
+                self._emit({"type": "deeplink", "value": vvalue})
+            elif vtype == "deeplink-new":
+                self._emit({"type": "deeplink", "value": vvalue})
+            elif vtype == "view-hierarchy":
+                self._enter_hierarchy_loading()
+            elif vtype == "dev-options":
+                self._enter_viewer("dev-options")
+            elif vtype == "install-apk":
+                self._pick_and_emit_apk()
+            elif vtype == "theme-switcher":
+                self._enter_themes()
+            elif vtype == "capture-settings":
+                self._enter_capture_settings()
+            elif vtype == "action-recorder":
+                self._enter_recorder()
+            elif vtype == "stop-recording":
+                self._enter_stop_recording_name()
+            elif vtype == "perf-trace":
+                self._enter_trace()
+            elif vtype == "memory-profiler":
+                self._enter_memory()
+            else:
+                self._emit({"type": vtype})
+        elif self.state == "actions":
+            label, vtype, vvalue = self._shown[idx]
+            if vtype in ("launch", "force-stop", "clear-data", "uninstall"):
+                self._emit({"type": "app-action", "pkg": self.sel_pkg, "action": vtype})
+            elif vtype in ("shared-prefs", "remote-config", "litmus", "permissions"):
+                self._enter_viewer(vtype, pkg=self.sel_pkg)
+            else:
+                self._emit({"type": "app-action", "pkg": self.sel_pkg, "action": vtype})
+        elif self.state == "viewer":
+            if self._viewer_on_enter:
+                self._viewer_on_enter(idx)
+        elif self.state == "capture-settings":
+            label, vtype, vvalue = self._shown[idx]
+            if vtype == "cap-bitrate":
+                self._emit({"type": "capture-settings", "bitrate": vvalue})
+            elif vtype == "cap-latency":
+                cur_ll = bool(self.data.get("capture_low_latency", False))
+                self._emit({"type": "capture-settings", "low_latency": not cur_ll})
+            elif vtype == "cap-fps":
+                self._emit({"type": "capture-settings", "fps_cap": vvalue})
+            elif vtype == "cap-encode-scale":
+                self._emit({"type": "capture-settings", "encode_scale": vvalue})
+            elif vtype == "cap-stats":
+                cur_sv = bool(self.data.get("capture_stats_visible", False))
+                self._emit({"type": "capture-settings", "stats_visible": not cur_sv})
+        elif self.state == "input":
+            text = self._var.get().strip()
+            if self._input_context == "heap-label":
+                self._start_dump("heap", text)
+            elif self._input_context == "hprof-label":
+                self._start_dump("hprof", text)
+            elif text:
+                if self._input_context == "stop-recording":
+                    self._emit({"type": "stop-recording", "name": text})
+                elif self._input_context == "insert-wait":
+                    try:
+                        ms = int(float(text) * 1000)
+                        self._emit({"type": "insert-wait", "ms": ms})
+                    except ValueError:
+                        pass  # invalid input, stay open
+                else:
+                    self._emit({"type": "input-text", "text": text})
+        elif self.state == "hierarchy":
+            if idx is None or idx >= len(self._hier_shown):
+                return
+            node = self._hier_shown[idx]
+            children = node.get("children", [])
+            if children:
+                self._hier_nav_stack.append(
+                    (self._hier_current_nodes, self._hier_current_label)
+                )
+                rid = node.get("resource_id", "")
+                text = node.get("text", "")
+                cls = node.get("class_name", "")
+                self._hier_current_nodes = children
+                self._hier_current_label = rid or (f'"{text[:20]}"' if text else cls)
+                self._var.set("")
+                self._hier_show_level()
+            elif node.get("cx") or node.get("cy"):
+                # Fire tap without closing palette — send via stderr side-channel
+                msg = {"action": "tap", "cx": node["cx"], "cy": node["cy"]}
+                print(json.dumps(msg), file=sys.stderr, flush=True)
+
+    def _on_escape(self, _=None):
+        if self.state == "hierarchy":
+            if self._var.get():
+                self._var.set("")
+                self._hier_show_level()
+            elif self._hier_nav_stack:
+                self._hier_current_nodes, self._hier_current_label = \
+                    self._hier_nav_stack.pop()
+                self._hier_show_level()
+            else:
+                self._send_hover(None)
+                self._enter_search()
+        elif self.state == "viewer" and self._viewer_on_back:
+            self._viewer_on_back()
+        elif self.state in ("actions", "input", "viewer", "capture-settings"):
+            self._enter_search()
+        else:
+            self._emit(None)
+
+    def _on_up(self, _=None):
+        self._move(-1)
+        return "break"
+
+    def _on_down(self, _=None):
+        self._move(1)
+        return "break"
+
+    def _on_refresh(self, _=None):
+        if self.state == "hierarchy":
+            self._enter_hierarchy_loading()
+        return "break"
+
+    def _on_sort(self, _=None):
+        if self.state == "viewer" and self._viewer_on_enter == self._on_trace_frame:
+            self._trace_sort = "time" if self._trace_sort == "dur" else "dur"
+            self._show_trace_frames()
+        elif self.state == "viewer" and self._viewer_on_enter == self._on_hprof_bitmap:
+            self._hp_bitmap_sort = "ratio" if self._hp_bitmap_sort == "size" else "size"
+            self._show_hprof_bitmaps()
+        elif self.state == "viewer" and self._viewer_on_enter == self._on_heap_class:
+            order = ("retained", "shallow", "cnt")
+            self._heap_sort = order[(order.index(self._heap_sort) + 1) % len(order)]
+            self._show_heap_classes()
+        return "break"
+
+    def _on_toggle_own(self, _=None):
+        if self.state == "viewer" and self._viewer_on_enter == self._on_heap_class:
+            self._heap_own = not self._heap_own
+            self._show_heap_classes()
+        return "break"
+
+    def _on_diff(self, _=None):
+        if self.state == "viewer" and self._viewer_on_enter == self._on_heap_snapshot:
+            self._diff_selected_snapshot()
+        return "break"
+
+    def _on_inspect(self, _=None):
+        if self.state == "viewer" and self._viewer_on_enter == self._on_heap_instance:
+            sel = self._selected_idx()
+            raw_idx = self._resolve_raw_idx(sel) if sel is not None else None
+            if raw_idx is not None and raw_idx < len(self._viewer_raw_items):
+                inst = self._viewer_raw_items[raw_idx]
+                if isinstance(inst, dict):
+                    self._open_holds(inst["id"], root=True)
+        return "break"
+
+    def _on_close(self):
+        self._emit(None)
+
+    # ── State transitions ─────────────────────────────────────────────────────
+
+    def _enter_search(self):
+        self.state   = "search"
+        self.sel_pkg = None
+        self._viewer_on_back = None
+        self._var.set("")
+        self._prompt.config(text=">")
+        self._refresh_search()
+        self._footer.config(text="↑↓=move  Enter=select  Esc=close")
+
+    def _enter_actions(self, pkg):
+        self.state    = "actions"
+        self.sel_pkg  = pkg
+        self._var.set("")
+        short = pkg if len(pkg) <= 38 else "..." + pkg[-35:]
+        self._prompt.config(text=f"{short}  >")
+        self._action_items = [(l, t, None) for l, t in APP_ACTIONS]
+        self._shown = list(self._action_items)
+        self._set_items(self._shown)
+        self._footer.config(text="↑↓=move  Enter=execute  Esc=back")
+
+    def _enter_input(self):
+        self.state = "input"
+        self._input_context = "input-text"
+        self._var.set("")
+        self._prompt.config(text="text >")
+        self._lb.delete(0, "end")
+        self._lb.insert("end", "  (type text and press Enter to send to device)")
+        self._footer.config(text="Enter=send to device  Esc=back")
+
+    # ── Hierarchy state ───────────────────────────────────────────────────────
+
+    _FETCH_TIMEOUT = 20  # seconds before fetch is considered hung
+
+    def _enter_hierarchy_loading(self):
+        _log.debug("_enter_hierarchy_loading called")
+        self.state = "hierarchy"
+        self._hier_nav_stack = []
+        self._hier_current_nodes = []
+        self._hier_current_label = "root"
+        self._hier_all_flat = []
+        self._hier_shown = []
+        self._var.set("")
+        self._prompt.config(text="View Hierarchy  >")
+        self._lb.delete(0, "end")
+        self._lb.insert("end", "  loading...")
+        self._footer.config(text="fetching UI hierarchy from device...")
+        _log.debug("starting _bg_fetch_hierarchy thread")
+        threading.Thread(target=self._bg_fetch_hierarchy, daemon=True).start()
+
+    def _bg_fetch_hierarchy(self):
+        import concurrent.futures
+        import time as _t
+        _t0 = _t.time()
+        dev = _get_u2_dev(self._serial)
+        _log.debug("hierarchy fetch start, u2 preconnected=%s", dev is not None)
+        try:
+            from keytap.inspectors.hierarchy import dump_hierarchy_tree
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(dump_hierarchy_tree, self._serial, dev)
+                root_node, flat_nodes = fut.result(timeout=self._FETCH_TIMEOUT)
+            _log.debug("hierarchy fetch done in %.2fs, %d nodes", _t.time() - _t0, len(flat_nodes))
+            self.root.after(0, lambda: self._show_hierarchy(root_node, flat_nodes))
+        except concurrent.futures.TimeoutError:
+            _log.warning("hierarchy fetch timed out after %.2fs", _t.time() - _t0)
+            self.root.after(0, lambda: self._show_fetch_error("timed out — device not responding"))
+        except Exception as e:
+            _log.error("hierarchy fetch error after %.2fs: %s", _t.time() - _t0, e)
+            self.root.after(0, lambda: self._show_fetch_error(str(e)))
+
+    def _show_hierarchy(self, root_node, flat_nodes):
+        self._hier_all_flat = flat_nodes
+        children = root_node.get("children", [])
+        self._hier_current_nodes = children if children else [root_node]
+        self._hier_current_label = "root"
+        self._var.set("")
+        self._hier_show_level()
+
+    def _hier_node_label(self, node):
+        cls   = node.get("class_name", "?")
+        text  = node.get("text", "")
+        rid   = node.get("resource_id", "")
+        n_ch  = len(node.get("children", []))
+        label = f"  {cls}"
+        if text:
+            label += f'  "{text[:30]}"'
+        if rid:
+            label += f"  [{rid}]"
+        if n_ch:
+            label += f"  ({n_ch})"
+        elif node.get("clickable"):
+            label += "  ·tap"
+        return label
+
+    def _hier_show_level(self):
+        self._hier_shown = list(self._hier_current_nodes)
+        self._lb.delete(0, "end")
+        for n in self._hier_shown:
+            self._lb.insert("end", self._hier_node_label(n))
+        if self._hier_shown:
+            self._lb.selection_set(0)
+            self._lb.activate(0)
+            self._lb.see(0)
+            self._send_hover_at(0)
+        self._hier_update_footer()
+
+    def _hier_update_footer(self, searching=False):
+        path_parts = [lbl for _, lbl in self._hier_nav_stack] + [self._hier_current_label]
+        path = " > ".join(path_parts[-4:])
+        n    = len(self._hier_shown)
+        scope = " (search)" if searching else ""
+        self._footer.config(
+            text=f"{path}  |  {n} nodes{scope}  Enter=expand/tap  Esc=up"
+        )
+
+    def _filter_hierarchy(self, query):
+        ql = query.strip().lower()
+        if not ql:
+            self._hier_shown = list(self._hier_current_nodes)
+        else:
+            self._hier_shown = [
+                n for n in self._hier_all_flat
+                if ql in n.get("text", "").lower()
+                or ql in n.get("resource_id", "").lower()
+                or ql in n.get("class_name", "").lower()
+                or ql in n.get("content_desc", "").lower()
+            ]
+        self._lb.delete(0, "end")
+        for n in self._hier_shown:
+            self._lb.insert("end", self._hier_node_label(n))
+        if self._hier_shown:
+            self._lb.selection_set(0)
+            self._lb.activate(0)
+            self._lb.see(0)
+            self._send_hover_at(0)
+        else:
+            self._send_hover(None)
+        self._hier_update_footer(searching=bool(ql))
+
+    def _on_lb_select(self, _=None):
+        if self.state == "hierarchy":
+            idx = self._selected_idx()
+            if idx is not None:
+                self._send_hover_at(idx)
+
+    def _send_hover_at(self, idx):
+        if idx < len(self._hier_shown):
+            self._send_hover(self._hier_shown[idx].get("bounds"))
+        else:
+            self._send_hover(None)
+
+    def _send_hover(self, bounds):
+        msg = {"hover": list(bounds) if bounds else None}
+        print(json.dumps(msg), file=sys.stderr, flush=True)
+
+    def _pick_and_emit_apk(self):
+        path = filedialog.askopenfilename(
+            title="Select APK to install",
+            filetypes=[("APK files", "*.apk"), ("All files", "*.*")],
+        )
+        if path:
+            self._emit({"type": "install-apk", "path": path})
+        # else: user cancelled, stay open
+
+    def _enter_viewer(self, fetch_type, pkg=None):
+        short = pkg.split(".")[-1] if pkg else ""
+        display = {
+            "shared-prefs":  f"Shared Prefs – {short}",
+            "remote-config": f"Remote Config – {short}",
+            "litmus":        f"Litmus – {short}",
+            "permissions":   f"Permissions – {short}",
+            "dev-options":   "Dev Options",
+        }.get(fetch_type, fetch_type)
+
+        # Set the Enter callback now — each interactive inspector owns its action.
+        # Read-only inspectors leave _viewer_on_enter = None.
+        if fetch_type == "dev-options":
+            self._viewer_on_enter = self._toggle_dev_option
+        elif fetch_type == "permissions":
+            self._viewer_on_enter = lambda idx, _pkg=pkg: self._toggle_permission(idx, _pkg)
+        else:
+            self._viewer_on_enter = None
+
+        _log.debug("_enter_viewer called: %s", fetch_type)
+        self.state = "viewer"
+        self._viewer_raw_items = []
+        self._var.set("")
+        self._prompt.config(text=f"{display}  >")
+        self._lb.delete(0, "end")
+        self._lb.insert("end", "  Loading...")
+        self._footer.config(text="Loading...  Esc=back")
+        _log.debug("starting _bg_fetch_viewer thread: %s", fetch_type)
+        threading.Thread(
+            target=self._bg_fetch_viewer, args=(fetch_type, pkg), daemon=True
+        ).start()
+
+    def _show_fetch_error(self, msg):
+        self._lb.delete(0, "end")
+        self._lb.insert("end", f"  error: {msg}")
+        self._footer.config(text=f"fetch failed — Esc=back")
+
+    def _bg_fetch_viewer(self, fetch_type, pkg=None):
+        import concurrent.futures
+        import time as _t
+        _t0 = _t.time()
+        _log.debug("viewer fetch start: %s", fetch_type)
+        interactive = False
+
+        def _do_fetch():
+            if fetch_type == "shared-prefs":
+                from keytap.inspectors import shared_prefs as _m
+                return _m.fetch(pkg), f"Shared Prefs – {pkg}", False
+            elif fetch_type == "remote-config":
+                from keytap.inspectors import remote_config as _m
+                return _m.fetch(pkg), f"Remote Config – {pkg}", False
+            elif fetch_type == "litmus":
+                from keytap.inspectors import litmus as _m
+                items, _ = _m.fetch(pkg)
+                return items, f"Litmus – {pkg}", False
+            elif fetch_type == "permissions":
+                from keytap.inspectors import permissions as _m
+                return _m.fetch(pkg), f"Permissions – {pkg}", True
+            elif fetch_type == "dev-options":
+                from keytap.inspectors import dev_options as _m
+                return _m.fetch(self._serial), "Dev Options", True
+            else:
+                return [("?", f"unsupported: {fetch_type}")], fetch_type, False
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(_do_fetch)
+                raw_items, label, interactive = fut.result(timeout=self._FETCH_TIMEOUT)
+            _log.debug("viewer fetch done in %.2fs, %d items", _t.time() - _t0, len(raw_items))
+        except concurrent.futures.TimeoutError:
+            _log.warning("viewer fetch timed out after %.2fs", _t.time() - _t0)
+            self.root.after(0, lambda: self._show_fetch_error("timed out — device not responding"))
+            return
+        except Exception as e:
+            _log.error("viewer fetch error after %.2fs: %s", _t.time() - _t0, e)
+            raw_items, label, interactive = [("error", str(e))], fetch_type, False
+        # Format tuples as display strings
+        bracket = fetch_type == "dev-options"
+        if fetch_type == "permissions" and interactive:
+            raw_items = [(self._GRANT_ALL, ""), (self._DENY_ALL, "")] + list(raw_items)
+        items = []
+        for it in raw_items:
+            if isinstance(it, (list, tuple)) and len(it) == 2:
+                if it[1] == "":
+                    items.append(f"  {it[0]}")
+                    continue
+                sep = f"  [{it[1]}]" if bracket else f"  =  {it[1]}"
+                items.append(f"  {it[0]}{sep}")
+            else:
+                items.append(f"  {it}")
+
+        self.root.after(0, lambda ri=raw_items, lbl=label, its=items, ia=interactive:
+                        self._show_viewer_items(lbl, its, ri, ia))
+
+    def _show_viewer_items(self, title, items, raw_items=None, interactive=False):
+        self._viewer_all       = list(items)
+        self._viewer_raw_items = list(raw_items) if raw_items else []
+        self._prompt.config(text=f"{title}  >")
+        self._viewer_shown_idx = list(range(len(items)))
+        self._lb.delete(0, "end")
+        for line in items:
+            self._lb.insert("end", line)
+        hint = "Enter=toggle  " if interactive else ""
+        self._footer.config(
+            text=f"{len(items)} items  |  ↑↓=move  {hint}Esc=back"
+        )
+        if items:
+            self._lb.selection_set(0)
+            self._lb.activate(0)
+
+    def _refresh_viewer(self):
+        if self._viewer_search and self._viewer_search[0] == self._viewer_on_enter:
+            self._viewer_search[1](self._var.get().strip().lower())
+            return
+        q = self._var.get().lower()
+        self._viewer_shown_idx = [
+            i for i, line in enumerate(self._viewer_all)
+            if not q or q in line.lower()
+        ]
+        self._lb.delete(0, "end")
+        for i in self._viewer_shown_idx:
+            self._lb.insert("end", self._viewer_all[i])
+        hint = "Enter=toggle  " if self._viewer_on_enter else ""
+        self._footer.config(
+            text=f"{len(self._viewer_shown_idx)} items  |  ↑↓=move  {hint}Esc=back"
+        )
+
+    # ── Dev options toggle ────────────────────────────────────────────────────
+
+    def _resolve_raw_idx(self, lb_idx):
+        """Map listbox position → _viewer_all / _viewer_raw_items index."""
+        if lb_idx < len(self._viewer_shown_idx):
+            return self._viewer_shown_idx[lb_idx]
+        return lb_idx  # fallback (unfiltered)
+
+    def _record_event(self, **event):
+        """Tell the app to record a device change made here. Only while a recording is running."""
+        if self.data.get("recording_active"):
+            print(json.dumps({"action": "record", **event}), file=sys.stderr, flush=True)
+
+    def _toggle_dev_option(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        label, _ = self._viewer_raw_items[raw_idx]
+        self._lb.delete(lb_idx)
+        self._lb.insert(lb_idx, f"  {label}  [...]")
+        self._lb.selection_set(lb_idx)
+        self._lb.activate(lb_idx)
+        serial = self._serial
+        def _do():
+            try:
+                from keytap.inspectors import dev_options as _m
+                new_state = _m.toggle_by_label(label, serial)
+            except Exception as e:
+                new_state = f"err: {e}"
+            if new_state not in ("?",) and not new_state.startswith("err"):
+                self._record_event(kind="dev_option", label=label, state=new_state)
+            self._viewer_raw_items[raw_idx] = (label, new_state)
+            display = f"  {label}  [{new_state}]"
+            self._viewer_all[raw_idx] = display
+            self.root.after(0, lambda: self._update_lb_item(lb_idx, display))
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _update_lb_item(self, lb_idx, text):
+        self._lb.delete(lb_idx)
+        self._lb.insert(lb_idx, text)
+        self._lb.selection_set(lb_idx)
+        self._lb.activate(lb_idx)
+
+    _GRANT_ALL = "[ GRANT ALL ]"
+    _DENY_ALL  = "[ DENY ALL ]"
+
+    def _bulk_permissions(self, pkg, grant):
+        self._footer.config(text="Granting all..." if grant else "Denying all...")
+        def _do():
+            try:
+                from keytap.inspectors import permissions as _m
+                _m.set_all(pkg, grant)
+                self._record_event(kind="permission", pkg=pkg, permission="*",
+                                   state="GRANTED" if grant else "DENIED")
+                items = _m.fetch(pkg)
+            except Exception as e:
+                items = [("error", str(e))]
+            raw = [(self._GRANT_ALL, ""), (self._DENY_ALL, "")] + items
+            lines = [f"  {p}" if st == "" else f"  {p}  =  {st}" for p, st in raw]
+            self.root.after(0, lambda: self._show_viewer_items(
+                f"Permissions – {pkg}", lines, raw, True))
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _toggle_permission(self, lb_idx, pkg):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        perm, _ = self._viewer_raw_items[raw_idx]
+        if perm in (self._GRANT_ALL, self._DENY_ALL):
+            self._bulk_permissions(pkg, perm == self._GRANT_ALL)
+            return
+        self._lb.delete(lb_idx)
+        self._lb.insert(lb_idx, f"  {perm}  =  ...")
+        self._lb.selection_set(lb_idx)
+        self._lb.activate(lb_idx)
+        serial = self._serial
+        def _do():
+            try:
+                from keytap.inspectors import permissions as _m
+                new_state = _m.toggle(perm, pkg, serial)
+            except Exception as e:
+                new_state = f"err: {e}"
+            if new_state in ("GRANTED", "DENIED"):
+                self._record_event(kind="permission", pkg=pkg, permission=perm, state=new_state)
+            self._viewer_raw_items[raw_idx] = (perm, new_state)
+            display = f"  {perm}  =  {new_state}"
+            self._viewer_all[raw_idx] = display
+            self.root.after(0, lambda: self._update_lb_item(lb_idx, display))
+        threading.Thread(target=_do, daemon=True).start()
+
+    # ── Action Recorder ───────────────────────────────────────────────────────
+
+    def _enter_recorder(self):
+        items = [
+            ("  Replay          – run a saved recording", "replay"),
+            ("  Manage          – edit / delete / view recordings", "manage"),
+            ("  Timeline Viewer – actions, logcat and network on one timeline", "timeline"),
+        ]
+        if self.data.get("recording_active"):
+            items.insert(0, ("  [Insert Wait]   – add a timed pause to recording", "insert-wait"))
+        else:
+            items = [
+                ("  Record - actions only   – taps, swipes, text, launches", "record-actions"),
+                ("  Record - full dump      – actions + network + timeline + video", "record-full"),
+            ] + items
+        self._viewer_raw_items = [t for _, t in items]
+        self._viewer_all       = [l for l, _ in items]
+        self._viewer_shown_idx = list(range(len(items)))
+        self._viewer_on_enter  = self._on_recorder_action
+        self.state = "viewer"
+        self._var.set("")
+        self._prompt.config(text="Action Recorder  >")
+        self._lb.delete(0, "end")
+        for label, _ in items:
+            self._lb.insert("end", label)
+        self._footer.config(text="Enter=select  Esc=back")
+        self._lb.selection_set(0)
+        self._lb.activate(0)
+
+    def _on_recorder_action(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        action = self._viewer_raw_items[raw_idx]
+        if action in ("record-actions", "record-full"):
+            self._emit({"type": "start-recording", "full": action == "record-full"})
+        elif action == "replay":
+            self._enter_recorder_replay()
+        elif action == "manage":
+            self._enter_recorder_manage()
+        elif action == "timeline":
+            self._open_timeline_viewer()
+        elif action == "insert-wait":
+            self._enter_recorder_insert_wait()
+
+    def _enter_recorder_replay(self):
+        try:
+            from keytap.recorder.recording import Recording
+            recordings = Recording.list_all()
+        except Exception:
+            recordings = []
+
+        if not recordings:
+            self._viewer_raw_items = []
+            self._viewer_all       = ["  No recordings found"]
+            self._viewer_shown_idx = [0]
+            self._viewer_on_enter  = None
+        else:
+            self._viewer_raw_items = recordings
+            self._viewer_all = [
+                f"  {r['name']}  –  {r['recorded_at'][:16]}  ({r['action_count']} steps)"
+                for r in recordings
+            ]
+            self._viewer_shown_idx = list(range(len(recordings)))
+            self._viewer_on_enter  = self._on_recording_selected
+
+        self.state = "viewer"
+        self._var.set("")
+        self._prompt.config(text="Replay  >")
+        self._lb.delete(0, "end")
+        for line in self._viewer_all:
+            self._lb.insert("end", line)
+        n = len(recordings)
+        self._footer.config(text=f"{n} recordings  |  Enter=select  Esc=back")
+        if self._viewer_all:
+            self._lb.selection_set(0)
+            self._lb.activate(0)
+
+    def _on_recording_selected(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        self._selected_recording = self._viewer_raw_items[raw_idx]
+        modes = [
+            ("  Timed  – replay at original speed", "timed"),
+            ("  Fast   – 300ms gap between actions", "fast"),
+            ("  Step   – press Space to advance",    "step"),
+        ]
+        self._viewer_raw_items = [m for _, m in modes]
+        self._viewer_all       = [l for l, _ in modes]
+        self._viewer_shown_idx = list(range(len(modes)))
+        self._viewer_on_enter  = self._on_mode_selected
+        self._var.set("")
+        self._prompt.config(text="Replay mode  >")
+        self._lb.delete(0, "end")
+        for label, _ in modes:
+            self._lb.insert("end", label)
+        self._footer.config(text="Enter=select  Esc=back")
+        self._lb.selection_set(0)
+        self._lb.activate(0)
+
+    def _on_mode_selected(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items) or not self._selected_recording:
+            return
+        mode = self._viewer_raw_items[raw_idx]
+        self._emit({"type": "replay", "path": self._selected_recording["path"], "mode": mode})
+
+    def _enter_stop_recording_name(self):
+        self.state = "input"
+        self._input_context = "stop-recording"
+        self._var.set("")
+        self._prompt.config(text="recording name >")
+        self._lb.delete(0, "end")
+        self._lb.insert("end", "  type a name, then press Enter to save")
+        self._footer.config(text="Enter=save  Esc=cancel")
+
+    def _enter_recorder_insert_wait(self):
+        self.state = "input"
+        self._input_context = "insert-wait"
+        self._var.set("")
+        self._prompt.config(text="wait (seconds) >")
+        self._lb.delete(0, "end")
+        self._lb.insert("end", "  e.g. 2.5 inserts a 2500ms pause at this point")
+        self._footer.config(text="Enter=insert  Esc=back")
+
+    def _enter_recorder_manage(self):
+        try:
+            from keytap.recorder.recording import Recording
+            recordings = Recording.list_all()
+        except Exception:
+            recordings = []
+
+        if not recordings:
+            self._viewer_raw_items = []
+            self._viewer_all       = ["  No recordings found"]
+            self._viewer_shown_idx = [0]
+            self._viewer_on_enter  = None
+        else:
+            self._viewer_raw_items = recordings
+            self._viewer_all = [
+                f"  {r['name']}  –  {r['recorded_at'][:16]}  ({r['action_count']} steps"
+                f"{', timeline' if r.get('has_timeline') else ''})"
+                for r in recordings
+            ]
+            self._viewer_shown_idx = list(range(len(recordings)))
+            self._viewer_on_enter  = self._on_manage_recording_selected
+
+        self.state = "viewer"
+        self._var.set("")
+        self._prompt.config(text="Manage Recordings  >")
+        self._lb.delete(0, "end")
+        for line in self._viewer_all:
+            self._lb.insert("end", line)
+        hint = "Enter=select  " if recordings else ""
+        self._footer.config(text=f"{len(recordings)} recordings  |  {hint}Esc=back")
+        if self._viewer_all:
+            self._lb.selection_set(0)
+            self._lb.activate(0)
+
+    def _on_manage_recording_selected(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        self._manage_recording = self._viewer_raw_items[raw_idx]
+        sub = [
+            ("  View Actions  – preview all steps in this recording", "view-actions"),
+            ("  Edit Actions  – open actions.json in vim (new Terminal window)", "edit"),
+            ("  Timeline      – open this recording in the Timeline Viewer", "timeline"),
+            ("  Delete        – permanently remove this recording",   "delete"),
+        ]
+        self._viewer_raw_items = [a for _, a in sub]
+        self._viewer_all       = [l for l, _ in sub]
+        self._viewer_shown_idx = list(range(len(sub)))
+        self._viewer_on_enter  = self._on_manage_action
+        self._var.set("")
+        name = self._manage_recording.get("name", "?")
+        self._prompt.config(text=f"{name}  >")
+        self._lb.delete(0, "end")
+        for label, _ in sub:
+            self._lb.insert("end", label)
+        self._footer.config(text="Enter=select  Esc=back")
+        self._lb.selection_set(0)
+        self._lb.activate(0)
+
+    def _on_manage_action(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items) or not self._manage_recording:
+            return
+        action = self._viewer_raw_items[raw_idx]
+        rec = self._manage_recording
+        if action == "delete":
+            try:
+                import os as _os
+                _os.remove(rec["path"])
+            except Exception:
+                pass
+            self._manage_recording = None
+            self._enter_recorder_manage()
+        elif action == "view-actions":
+            self._show_recording_actions(rec)
+        elif action == "edit":
+            self._edit_recording(rec)
+        elif action == "timeline":
+            if rec.get("has_timeline"):
+                self._open_timeline_viewer(rec["path"])
+            else:
+                self._footer.config(text="no timeline for this recording (it was recorded as actions only)")
+
+    def _open_timeline_viewer(self, path=None):
+        """Launch timeline_viewer.py as its own window/process. With no path it asks for a recording."""
+        try:
+            with open(LOG_FILE, "ab") as log:
+                subprocess.Popen(module_command("keytap.ui.timeline_viewer", *([path] if path else [])),
+                                 stdout=log, stderr=log, start_new_session=True, env=child_env())
+            self._footer.config(text="opened the Timeline Viewer in a new window  |  Esc=back")
+        except Exception as e:
+            self._footer.config(text=f"could not open the Timeline Viewer: {str(e)[:70]}")
+
+    def _edit_recording(self, rec):
+        """Open actions.json in vim in a new Terminal window. A backup is kept as actions.json.bak,
+        and the file is validated when vim closes so a typo shows up now, not mid-replay."""
+        path = rec["path"]
+        target = os.path.join(path, "actions.json") if os.path.isdir(path) else path
+        if sys.platform != "darwin":
+            self._footer.config(text=f"edit manually: {target}")
+            return
+        try:
+            shutil.copy2(target, target + ".bak")
+            script = (
+                f'F={shlex.quote(target)}; '
+                'if command -v vim >/dev/null 2>&1; then vim "$F"; else vi "$F"; fi; echo; '
+                f'PYTHONPATH={shlex.quote(str(ROOT))} {shlex.quote(sys.executable)} -m keytap.recorder.recording --check "$F"; echo; '
+                'echo "Backup of the version before this edit: $F.bak"; echo; '
+                'read -n 1 -s -r -p "Press any key to close this window..."'
+            )
+            cmd = f"/bin/bash -c {shlex.quote(script)}; exit"
+            escaped = cmd.replace("\\", "\\\\").replace('"', '\\"')
+            subprocess.Popen(["osascript",
+                              "-e", 'tell application "Terminal"',
+                              "-e", "activate",
+                              "-e", f'do script "{escaped}"',
+                              "-e", "end tell"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._footer.config(text="opened in Terminal (vim)  |  save with :wq  |  Esc=back")
+        except Exception as e:
+            self._footer.config(text=f"could not open editor: {str(e)[:80]}")
+
+    def _show_recording_actions(self, rec):
+        try:
+            from keytap.recorder.recording import Recording, action_label
+            r = Recording.load(rec["path"])
+            items = [f"  {i + 1:3}  {action_label(a)}" for i, a in enumerate(r.actions)]
+        except Exception as e:
+            items = [f"  error: {e}"]
+        self._viewer_raw_items = []
+        self._viewer_all       = items
+        self._viewer_shown_idx = list(range(len(items)))
+        self._viewer_on_enter  = None
+        self._var.set("")
+        self._prompt.config(text=f"{rec.get('name', '?')}  >")
+        self._lb.delete(0, "end")
+        for line in items:
+            self._lb.insert("end", line)
+        self._footer.config(text=f"{len(items)} actions  |  Esc=back")
+        if items:
+            self._lb.selection_set(0)
+            self._lb.activate(0)
+
+    # ── Theme switcher ────────────────────────────────────────────────────────
+
+    def _enter_themes(self):
+        self.state = "viewer"
+        self._viewer_on_enter = self._apply_theme
+        self._var.set("")
+        self._prompt.config(text="Theme  >")
+        try:
+            from keytap.ui import theme_manager
+            themes = theme_manager.list_themes()
+            active = theme_manager.active_name()
+        except Exception:
+            themes = []
+            active = ""
+        self._viewer_raw_items = themes
+        self._viewer_all       = [f"  {'* ' if t == active else '  '}{t}" for t in themes]
+        self._viewer_shown_idx = list(range(len(themes)))
+        self._lb.delete(0, "end")
+        for line in self._viewer_all:
+            self._lb.insert("end", line)
+        self._footer.config(text=f"{len(themes)} themes  |  Enter=apply  Esc=back")
+        if themes:
+            self._lb.selection_set(0)
+            self._lb.activate(0)
+
+    def _apply_theme(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        name = self._viewer_raw_items[raw_idx]
+        try:
+            from keytap.ui import theme_manager
+            theme_manager.set_theme(name)
+        except Exception:
+            pass
+        self._emit({"type": "theme-changed", "theme": name})
+
+    # ── Perf Trace ────────────────────────────────────────────────────────────
+
+    def _set_trace_viewer(self, prompt, rows, footer, on_enter=None, on_back=None):
+        """rows: [(label, raw)]. raw=None rows are informational and ignored on Enter."""
+        self._viewer_raw_items = [r for _, r in rows]
+        self._viewer_all       = [l for l, _ in rows]
+        self._viewer_shown_idx = list(range(len(rows)))
+        self._viewer_on_enter  = on_enter
+        self._viewer_on_back   = on_back
+        self.state = "viewer"
+        self._var.set("")
+        self._prompt.config(text=f"{prompt}  >")
+        self._lb.delete(0, "end")
+        for label, _ in rows:
+            self._lb.insert("end", label)
+        self._footer.config(text=footer)
+        if rows:
+            self._lb.selection_set(0)
+            self._lb.activate(0)
+
+    def _enter_trace(self):
+        self._trace_path = None
+        if self.data.get("trace_active"):
+            rows = [("  [Stop trace]     – stop and save", "stop")]
+        else:
+            rows = [
+                ("  Start (light)   – frame timeline, low overhead", "light"),
+                ("  Start (full)    – adds CPU scheduling, higher overhead", "full"),
+            ]
+        rows.append(("  Results         – janky frames in saved traces", "results"))
+        self._set_trace_viewer("Perf Trace", rows, "Enter=select  Esc=back",
+                               on_enter=self._on_trace_action)
+
+    def _on_trace_action(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        action = self._viewer_raw_items[raw_idx]
+        if action in ("light", "full"):
+            self._emit({"type": "start-trace", "preset": action})
+        elif action == "stop":
+            self._emit({"type": "stop-trace"})
+        elif action == "results":
+            self._enter_trace_results()
+
+    def _enter_trace_results(self):
+        try:
+            from keytap.profiler.perf_trace import list_traces
+            traces = list_traces()
+        except Exception:
+            traces = []
+        if not traces:
+            self._set_trace_viewer("Traces", [("  No traces found", None)],
+                                   "Esc=back", on_back=self._enter_trace)
+            return
+        rows = []
+        for t in traces:
+            tags = []
+            if t.get("debuggable"):
+                tags.append("debuggable")
+            if (t.get("sdk") or 99) < 31:
+                tags.append("sdk<31")
+            tag = f"  [{', '.join(tags)}]" if tags else ""
+            rows.append((f"  {t.get('started_at', '')[:16]}  {t.get('preset', ''):<5} "
+                         f"{t.get('duration_s', 0):>6.1f}s  {t.get('package', '') or '-'}{tag}", t))
+        self._set_trace_viewer("Traces", rows,
+                               f"{len(rows)} traces  |  Enter=analyze  Esc=back",
+                               on_enter=self._on_trace_selected, on_back=self._enter_trace)
+
+    def _on_trace_selected(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        meta = self._viewer_raw_items[raw_idx]
+        self._trace_path = meta["path"]
+        self._trace_meta = meta
+        self._set_trace_viewer("Janky frames", [("  analyzing trace...  (first run downloads trace_processor)", None)],
+                               "Esc=back", on_back=self._enter_trace_results)
+        threading.Thread(target=self._bg_analyze, args=(meta["path"],), daemon=True).start()
+
+    def _bg_analyze(self, path):
+        err = None
+        try:
+            from keytap.profiler import trace_queries
+            frames, warns = trace_queries.analyze(path)
+        except Exception as e:
+            frames, warns, err = [], [], str(e)
+        self.root.after(0, lambda: self._on_trace_analyzed(path, frames, warns, err))
+
+    def _on_trace_analyzed(self, path, frames, warns, err):
+        if self._trace_path != path:
+            return   # user navigated away while analyzing
+        if err:
+            self._set_trace_viewer("Janky frames", [(f"  error: {err[:90]}", None)],
+                                   "Esc=back", on_back=self._enter_trace_results)
+            return
+        meta = self._trace_meta
+        if meta.get("debuggable"):
+            warns.append("debuggable build: timings are pessimistic, prefer a profileable build")
+        if meta.get("features"):
+            warns.append("captured with: " + ", ".join(meta["features"]))
+        self._trace_frames = frames
+        self._trace_warns  = warns
+        self._show_trace_frames()
+
+    @staticmethod
+    def _fmt_rel(ns):
+        s = max(0, ns) / 1e9
+        return f"{int(s // 60):02d}:{s % 60:04.1f}"
+
+    def _show_trace_frames(self):
+        frames = sorted(self._trace_frames,
+                        key=(lambda f: -f["dur"]) if self._trace_sort == "dur"
+                        else (lambda f: f["rel_ts"]))
+        rows = [(f"  ! {w}", None) for w in self._trace_warns]
+        if not frames:
+            rows.append(("  no janky frames found", None))
+        for f in frames:
+            rows.append((f"  {self._fmt_rel(f['rel_ts']):>8}  {f['dur'] / 1e6:6.1f}ms  "
+                         f"{f['jank_type'][:24]:<24}  {f['process'][-28:]}", f))
+        self._set_trace_viewer(
+            "Janky frames", rows,
+            f"{len(frames)} janky frames  |  sort: {self._trace_sort} (Cmd+S)  |  Enter=slices  Esc=back",
+            on_enter=self._on_trace_frame, on_back=self._enter_trace_results)
+
+    def _on_trace_frame(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        frame = self._viewer_raw_items[raw_idx]
+        if not isinstance(frame, dict):
+            return
+        self._set_trace_viewer("Frame slices", [("  querying slices...", None)],
+                               "Esc=back", on_back=self._show_trace_frames)
+        threading.Thread(target=self._bg_slices, args=(frame,), daemon=True).start()
+
+    def _bg_slices(self, frame):
+        path = self._trace_path
+        err = None
+        try:
+            from keytap.profiler import trace_queries
+            slices = trace_queries.frame_slices(path, frame)
+        except Exception as e:
+            slices, err = [], str(e)
+        self.root.after(0, lambda: self._on_trace_slices(path, frame, slices, err))
+
+    def _on_trace_slices(self, path, frame, slices, err):
+        if self._trace_path != path or self._viewer_on_back != self._show_trace_frames:
+            return
+        head = (f"  frame @ {self._fmt_rel(frame['rel_ts'])}  {frame['dur'] / 1e6:.1f}ms  "
+                f"{frame['jank_type']}  {frame['process']}")
+        rows = [(head, None)]
+        if err:
+            rows.append((f"  error: {err[:90]}", None))
+        elif not slices:
+            rows.append(("  no app slices in this window (try the full preset, or the app emits no trace sections)", None))
+        for s in slices:
+            rows.append((f"  {s['dur'] / 1e6:7.1f}ms  {s['thread'][:12]:<12} d{s['depth']}  {s['name'][:60]}", None))
+        self._set_trace_viewer("Frame slices", rows,
+                               "longest main-thread / RenderThread slices  |  Esc=back",
+                               on_back=self._show_trace_frames)
+
+    # ── Memory Profiler ───────────────────────────────────────────────────────
+
+    _HEAP_ROW_CAP = 1000
+
+    @staticmethod
+    def _fmt_bytes(n, signed=False):
+        sign = "+" if signed and n > 0 else ""
+        if abs(n) >= 1 << 20:
+            return f"{sign}{n / (1 << 20):.1f}MB"
+        if abs(n) >= 1 << 10:
+            return f"{sign}{n / (1 << 10):.0f}KB"
+        return f"{sign}{n}B"
+
+    def _fill_viewer(self, lines, raws):
+        self._viewer_all       = lines
+        self._viewer_raw_items = raws
+        self._viewer_shown_idx = list(range(len(lines)))
+        self._lb.delete(0, "end")
+        for line in lines:
+            self._lb.insert("end", line)
+        if lines:
+            self._lb.selection_set(0)
+            self._lb.activate(0)
+
+    def _enter_memory(self):
+        self._heap_meta = None
+        rows = [
+            ("  Heap Snapshot   – dump the foreground app's Java heap", "snapshot"),
+            ("  Snapshots       – top classes, reference paths, diff", "list"),
+            ("  Detail Snapshot – activities, RecyclerViews, bitmaps, strings", "hprof"),
+            ("  Detail Snapshots – open a saved detail dump", "hprof-list"),
+        ]
+        self._set_trace_viewer("Memory Profiler", rows, "Enter=select  Esc=back",
+                               on_enter=self._on_memory_action)
+
+    def _on_memory_action(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        action = self._viewer_raw_items[raw_idx]
+        if action == "snapshot":
+            self._enter_heap_label()
+        elif action == "hprof":
+            self._enter_heap_label("hprof-label")
+        elif action == "hprof-list":
+            self._enter_hprof_list()
+        else:
+            self._enter_heap_list()
+
+    def _enter_heap_label(self, context="heap-label"):
+        self.state = "input"
+        self._input_context = context
+        self._var.set("")
+        self._prompt.config(text="snapshot label (optional) >")
+        self._lb.delete(0, "end")
+        self._lb.insert("end", "  e.g. after opening Orders, before back")
+        self._lb.insert("end", "  The app freezes while the heap is dumped (a few seconds, longer for big heaps)")
+        self._lb.selection_set(0)   # _on_enter ignores Enter when nothing is selected
+        self._footer.config(text="Enter=dump  Esc=cancel")
+
+    def _enter_heap_list(self):
+        self._heap_meta = None
+        try:
+            from keytap.profiler.heap_dump import list_snapshots
+            snaps = list_snapshots()
+        except Exception:
+            snaps = []
+        self._heap_snaps = snaps
+        if not snaps:
+            self._set_trace_viewer("Snapshots", [("  No snapshots found", None)],
+                                   "Esc=back", on_back=self._enter_memory)
+            return
+        rows = []
+        for s in snaps:
+            java = s.get("meminfo", {}).get("java_kb")
+            heap = f"java {java / 1024:>4.0f}MB" if java else "java    ?"
+            rows.append((f"  {s.get('started_at', '')[5:16]}  {heap}  {s.get('package', '')}"
+                         f"  {s.get('label', '')}", s))
+        self._set_trace_viewer(
+            "Snapshots", rows,
+            f"{len(rows)} snapshots  |  Enter=open  Cmd+D=diff vs previous  Esc=back",
+            on_enter=self._on_heap_snapshot, on_back=self._enter_memory)
+
+    def _on_heap_snapshot(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx < len(self._viewer_raw_items):
+            self._open_heap(self._viewer_raw_items[raw_idx], None)
+
+    def _diff_selected_snapshot(self):
+        sel = self._selected_idx()
+        if sel is None:
+            return
+        raw_idx = self._resolve_raw_idx(sel)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        meta = self._viewer_raw_items[raw_idx]
+        snaps = self._heap_snaps
+        older = next((s for s in snaps[snaps.index(meta) + 1:]
+                      if s.get("package") == meta.get("package")), None)
+        if older is None:
+            self._footer.config(text=f"no older snapshot of {meta.get('package')} to diff against")
+            return
+        self._open_heap(meta, older)
+
+    def _open_heap(self, meta, old):
+        self._heap_meta, self._heap_old = meta, old
+        self._heap_rows = []
+        self._set_trace_viewer("Heap", [("  analyzing heap...  (first open takes a few seconds)", None)],
+                               "Esc=back", on_back=self._enter_heap_list)
+        threading.Thread(target=self._bg_heap_classes, args=(meta, old), daemon=True).start()
+
+    def _bg_heap_classes(self, meta, old):
+        rows, warns, err = [], [], None
+        try:
+            from keytap.profiler import heap_queries
+            rows, warns = heap_queries.classes(meta["path"])
+            if old:
+                old_rows, _ = heap_queries.classes(old["path"])
+                rows = heap_queries.diff(old_rows, rows)
+        except Exception as e:
+            err = str(e)
+        self.root.after(0, lambda: self._on_heap_classes(meta, old, rows, warns, err))
+
+    def _on_heap_classes(self, meta, old, rows, warns, err):
+        if self._heap_meta is not meta or self._heap_old is not old:
+            return   # user navigated away while analyzing
+        if err:
+            self._set_trace_viewer("Heap", [(f"  error: {err[:90]}", None)],
+                                   "Esc=back", on_back=self._enter_heap_list)
+            return
+        self._heap_rows  = rows
+        self._heap_warns = warns
+        self._heap_sort  = "retained"
+        self._show_heap_classes()
+
+    def _heap_prefix(self):
+        return ".".join(self._heap_meta.get("package", "").split(".")[:2])
+
+    def _heap_line(self, r):
+        diff = self._heap_old is not None
+        cnt = f"{r['cnt']:+d}" if diff else str(r["cnt"])
+        return (f"  {self._fmt_bytes(r['retained'], diff):>9} {self._fmt_bytes(r['shallow'], diff):>9}"
+                f" {cnt:>8}  {r['name']}")
+
+    def _heap_header(self):
+        meta, old = self._heap_meta, self._heap_old
+        if old:
+            head = (f"  diff: {old.get('label') or old.get('started_at', '')[5:16]}"
+                    f"  ->  {meta.get('label') or meta.get('started_at', '')[5:16]}")
+        else:
+            mi = meta.get("meminfo", {})
+            parts = [meta.get("package", "")]
+            for key, name in (("java_kb", "java"), ("native_kb", "native"), ("graphics_kb", "gfx")):
+                if key in mi:
+                    parts.append(f"{name} {mi[key] / 1024:.0f}MB")
+            for key, name in (("activities", "activities"), ("views", "views")):
+                if key in mi:
+                    parts.append(f"{name} {mi[key]}")
+            head = "  " + "  ".join(parts)
+        rows = [(head, None)]
+        if meta.get("label") and not old:
+            rows.append((f"  label: {meta['label']}", None))
+        rows += [(f"  ! {w}", None) for w in self._heap_warns]
+        sign = "+" if old else " "
+        rows.append((f"  {'retained':>9} {'shallow':>9} {sign}{'count':>7}  class", None))
+        return rows
+
+    def _show_heap_classes(self):
+        key = self._heap_sort
+        rows = sorted(self._heap_rows, key=lambda r: -r[key])
+        prefix = self._heap_prefix()
+        if self._heap_own and prefix:
+            shown = [r for r in rows if r["name"].startswith(prefix)]
+        else:
+            shown = rows
+        capped = shown[:self._HEAP_ROW_CAP]
+        head = self._heap_header()
+        self._heap_default = ([l for l, _ in head] + [self._heap_line(r) for r in capped],
+                              [None] * len(head) + capped)
+        scope = f"own: {prefix}" if self._heap_own and prefix else "all classes"
+        more = f", top {len(capped)} of {len(shown)}" if len(shown) > len(capped) else ""
+        self._heap_footer = (f"{scope}{more}  |  sort: {key} (Cmd+S)  |  Cmd+O=own/all  |  "
+                             f"type to search all  |  Enter=instances (Bitmap: sizes)  Esc=back")
+        self._viewer_search = (self._on_heap_class, self._heap_search)
+        self._set_trace_viewer("Heap diff" if self._heap_old else "Heap",
+                               list(zip(*self._heap_default)), self._heap_footer,
+                               on_enter=self._on_heap_class, on_back=self._enter_heap_list)
+
+    def _heap_search(self, q):
+        """Typed text searches every class, ignoring the own-code filter."""
+        if not q:
+            self._fill_viewer(*self._heap_default)
+            self._footer.config(text=self._heap_footer)
+            return
+        key = self._heap_sort
+        hits = sorted((r for r in self._heap_rows if q in r["name"].lower()), key=lambda r: -r[key])
+        capped = hits[:self._HEAP_ROW_CAP]
+        self._fill_viewer([self._heap_line(r) for r in capped], capped)
+        self._footer.config(text=f"{len(capped)} of {len(hits)} matches in all classes  |  "
+                                 f"Enter=instances  Esc=back")
+
+    def _on_heap_class(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        row = self._viewer_raw_items[raw_idx]
+        if not isinstance(row, dict) or row.get("cid") is None:
+            return
+        if row["name"] == "android.graphics.Bitmap":
+            self._open_bitmaps()
+            return
+        self._heap_class = row
+        self._set_trace_viewer("Instances", [("  querying instances...", None)],
+                               "Esc=back", on_back=self._show_heap_classes)
+        threading.Thread(target=self._bg_heap_instances, args=(self._heap_meta, row), daemon=True).start()
+
+    def _bg_heap_instances(self, meta, row):
+        insts, err = [], None
+        try:
+            from keytap.profiler import heap_queries
+            insts = heap_queries.instances(meta["path"], row["cid"])
+        except Exception as e:
+            err = str(e)
+        self.root.after(0, lambda: self._on_heap_instances(meta, insts, err))
+
+    def _on_heap_instances(self, meta, insts, err):
+        if self._heap_meta is not meta or self._viewer_on_back != self._show_heap_classes:
+            return
+        self._heap_insts = [(f"  {self._fmt_bytes(i['retained']):>9} {self._fmt_bytes(i['size']):>9}"
+                             f"  #{i['id']}  {i['rd']} hops from root", i) for i in insts]
+        self._heap_inst_err = err
+        self._show_heap_instances()
+
+    def _show_heap_instances(self):
+        c = self._heap_class
+        rows = [(f"  {c['name']}  -  {c['cnt']} instances, {self._fmt_bytes(c['retained'])} retained", None)]
+        if self._heap_inst_err:
+            rows.append((f"  error: {self._heap_inst_err[:90]}", None))
+        rows.append((f"  {'retained':>9} {'shallow':>9}  instance", None))
+        rows += self._heap_insts
+        self._set_trace_viewer("Instances", rows,
+                               f"largest {len(self._heap_insts)} by retained size  |  Enter=reference path  |  Cmd+I=what it holds  Esc=back",
+                               on_enter=self._on_heap_instance, on_back=self._show_heap_classes)
+
+    def _on_heap_instance(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        inst = self._viewer_raw_items[raw_idx]
+        if not isinstance(inst, dict):
+            return
+        self._open_heap_path(inst, f"{self._heap_class['name']} #{inst['id']}  -  "
+                                   f"{self._fmt_bytes(inst['retained'])} retained",
+                             self._show_heap_instances)
+
+    def _open_heap_path(self, inst, title, back):
+        self._set_trace_viewer("Reference path", [("  finding path to GC root...", None)],
+                               "Esc=back", on_back=back)
+        threading.Thread(target=self._bg_heap_path,
+                         args=(self._heap_meta, inst, title, back), daemon=True).start()
+
+    def _bg_heap_path(self, meta, inst, title, back):
+        res, err = None, None
+        try:
+            from keytap.profiler import heap_queries
+            res = heap_queries.ref_path(meta["path"], inst["id"])
+        except Exception as e:
+            err = str(e)
+        self.root.after(0, lambda: self._on_heap_path(meta, title, back, res, err))
+
+    def _on_heap_path(self, meta, title, back, res, err):
+        if self._heap_meta is not meta or self._viewer_on_back != back:
+            return
+        rows = [(f"  {title}", None)]
+        if err:
+            rows.append((f"  error: {err[:90]}", None))
+        else:
+            root, hops, complete = res
+            rows.append((f"  GC root: {root or '?'}", None))
+            for i, (cls, field) in enumerate(hops):
+                rows.append((f"  {'-> ' if i else '   '}{cls}" + (f"  .{field}" if field else ""), None))
+            if not complete:
+                rows.append(("  ! path incomplete (no referrer found closer to a root)", None))
+        self._set_trace_viewer("Reference path", rows,
+                               "what keeps this object alive, root first  |  Esc=back",
+                               on_back=back)
+
+    def _open_holds(self, obj_id, root=False):
+        if root:
+            self._holds_stack = []
+        self._holds_stack.append(obj_id)
+        self._set_trace_viewer("What it holds",
+                               [("  loading...  (first use builds an index of the snapshot, a few seconds)", None)],
+                               "Esc=back", on_back=self._holds_back)
+        threading.Thread(target=self._bg_holds, args=(self._heap_meta, obj_id), daemon=True).start()
+
+    def _holds_back(self):
+        self._holds_stack.pop()
+        if self._holds_stack:
+            self._open_holds(self._holds_stack.pop())
+        else:
+            self._show_heap_instances()
+
+    def _bg_holds(self, meta, obj_id):
+        res, err = None, None
+        try:
+            from keytap.profiler import heap_queries
+            res = heap_queries.holds(meta["path"], obj_id)
+        except Exception as e:
+            err = str(e)
+        self.root.after(0, lambda: self._on_holds(meta, obj_id, res, err))
+
+    def _on_holds(self, meta, obj_id, res, err):
+        if (self._heap_meta is not meta or not self._holds_stack or self._holds_stack[-1] != obj_id
+                or self._viewer_on_back != self._holds_back):
+            return
+        if err:
+            self._set_trace_viewer("What it holds", [(f"  error: {err[:90]}", None)],
+                                   "Esc=back", on_back=self._holds_back)
+            return
+        b = self._fmt_bytes
+        h = res["head"]
+        crumbs = f"  (depth {len(self._holds_stack)})" if len(self._holds_stack) > 1 else ""
+        rows = [(f"  {h['cname']} #{h['id']}  -  shallow {b(h['size'])}, retained {b(h['retained'])}, "
+                 f"{h['objs']} objects{crumbs}", None)]
+
+        def field_row(x):
+            return (f"  {b(x['excl']) if x['excl'] else 'shared':>8}  {x['field'][:26]:<26} -> {x['cname']}  #{x['id']}", x)
+
+        rows.append(("  fields it exclusively keeps alive (size freed with it)", None))
+        rows += [field_row(x) for x in res["owned"]]
+        if res["owned_more"]:
+            rows.append((f"  ... {res['owned_more']} more owned fields not shown", None))
+        if not res["owned"]:
+            rows.append(("  (none: it references nothing that only it keeps alive)", None))
+        rows.append(("  everything it exclusively retains, by class", None))
+        rows += [(f"  {b(c['size']):>8}  x{c['cnt']:<6} {c['cname']}", None) for c in res["by_class"]]
+        if res["shared"]:
+            rows.append(("  fields shared with other objects (not freed with it)", None))
+            rows += [field_row(x) for x in res["shared"]]
+            if res["shared_more"]:
+                rows.append((f"  ... {res['shared_more']} more shared fields not shown", None))
+        self._set_trace_viewer("What it holds", rows,
+                               "Enter=open field  |  Esc=back one level",
+                               on_enter=self._on_holds_field, on_back=self._holds_back)
+
+    def _on_holds_field(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        x = self._viewer_raw_items[raw_idx]
+        if isinstance(x, dict):
+            self._open_holds(x["id"])
+
+    def _open_bitmaps(self):
+        meta = self._heap_meta
+        self._set_trace_viewer("Bitmaps", [("  querying bitmaps...", None)],
+                               "Esc=back", on_back=self._show_heap_classes)
+        threading.Thread(target=self._bg_heap_bitmaps, args=(meta,), daemon=True).start()
+
+    def _bg_heap_bitmaps(self, meta):
+        rows, err = [], None
+        try:
+            from keytap.profiler import heap_queries
+            rows = heap_queries.bitmaps(meta["path"])
+        except Exception as e:
+            err = str(e)
+        self.root.after(0, lambda: self._on_heap_bitmaps(meta, rows, err))
+
+    def _on_heap_bitmaps(self, meta, rows, err):
+        if self._heap_meta is not meta or self._viewer_on_back != self._show_heap_classes:
+            return
+        self._heap_bitmaps = rows
+        self._heap_bitmaps_err = err
+        self._show_heap_bitmaps()
+
+    def _bitmap_flags(self, b, screen_px):
+        flags = []
+        if screen_px and b["w"] * b["h"] > screen_px:
+            flags.append(">screen")
+        if b["bpp"] not in (0, 4):
+            flags.append(f"{b['bpp']}B/px")
+        if b["dup"] >= 3:
+            flags.append(f"x{b['dup']} same size")
+        return ", ".join(flags)
+
+    def _show_heap_bitmaps(self):
+        meta, bms = self._heap_meta, self._heap_bitmaps
+        screen = meta.get("screen")
+        screen_px = screen[0] * screen[1] if screen else 0
+        total = sum(b["size"] for b in bms)
+        big = sum(1 for b in bms if screen_px and b["w"] * b["h"] > screen_px)
+        head = f"  {len(bms)} bitmaps, {self._fmt_bytes(total)} total"
+        if screen:
+            head += f"  |  {big} larger than the screen ({screen[0]}x{screen[1]})"
+        else:
+            head += "  |  screen size unknown for this snapshot (re-dump to flag oversized bitmaps)"
+        rows = [(head, None)]
+        if self._heap_bitmaps_err:
+            rows.append((f"  error: {self._heap_bitmaps_err[:90]}", None))
+        rows.append((f"  {'size':>8}  {'dimensions':<11} flags", None))
+        for b in bms:
+            rows.append((f"  {self._fmt_bytes(b['size']):>8}  {str(b['w']) + 'x' + str(b['h']):<11} "
+                         f"{self._bitmap_flags(b, screen_px)}  #{b['id']}", b))
+        self._set_trace_viewer("Bitmaps", rows,
+                               "largest first  |  type to filter (e.g. >screen)  |  Enter=who holds it  Esc=back",
+                               on_enter=self._on_heap_bitmap, on_back=self._show_heap_classes)
+
+    def _on_heap_bitmap(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        b = self._viewer_raw_items[raw_idx]
+        if not isinstance(b, dict):
+            return
+        self._open_heap_path(b, f"Bitmap #{b['id']}  {b['w']}x{b['h']}  {self._fmt_bytes(b['size'])}",
+                             self._show_heap_bitmaps)
+
+    # ── Snapshot capture with live progress ───────────────────────────────────
+
+    _SPINNER = "|/-\\"
+
+    def _start_dump(self, kind, label):
+        """Run a snapshot capture inside the palette so it can show progress, not close on Enter."""
+        d = {"kind": kind, "stage": "starting...", "t0": time.time(), "path": None, "err": None}
+        self._dump = d
+        self._set_trace_viewer(self._dump_title(d), [("  starting...", None)],
+                               "dump in progress, please wait", on_back=self._dump_back)
+
+        def _run():
+            try:
+                if kind == "heap":
+                    from keytap.profiler.heap_dump import capture
+                else:
+                    from keytap.profiler.hprof_dump import capture
+                d["path"] = capture(self._serial, label, lambda msg: d.__setitem__("stage", msg))
+            except Exception as e:
+                d["err"] = str(e) or type(e).__name__
+        threading.Thread(target=_run, daemon=True).start()
+        self._tick_dump(d)
+
+    @staticmethod
+    def _dump_title(d):
+        return "Heap Snapshot" if d["kind"] == "heap" else "Detail Snapshot"
+
+    def _dump_back(self):
+        if self._dump is not None:
+            self._footer.config(text="dump in progress, please wait (closing now would leave it unfinished)")
+        else:
+            self._enter_memory()
+
+    def _tick_dump(self, d):
+        if self._dump is not d:
+            return
+        if d["path"] or d["err"]:
+            self._finish_dump(d)
+            return
+        elapsed = int(time.time() - d["t0"])
+        spin = self._SPINNER[int(time.time() * 6) % len(self._SPINNER)]
+        lines = [f"  [{spin}]  {self._dump_title(d)}  -  {elapsed}s elapsed",
+                 f"        {d['stage']}",
+                 "",
+                 "  The app freezes while the heap is written. Keep this window open."]
+        self._fill_viewer(lines, [None] * len(lines))
+        self.root.after(150, lambda: self._tick_dump(d))
+
+    def _finish_dump(self, d):
+        self._dump = None
+        title = self._dump_title(d)
+        if d["err"]:
+            self._set_trace_viewer(title, [(f"  failed: {d['err'][:110]}", None)],
+                                   "Esc=back", on_back=self._enter_memory)
+            return
+        elapsed = int(time.time() - d["t0"])
+        rows = [(f"  Saved in {elapsed}s: {os.path.basename(d['path'])}", None),
+                ("", None),
+                ("  Open it now", d["kind"]),
+                ("  Back to Memory Profiler", "back")]
+        self._set_trace_viewer(title, rows, "Enter=select  Esc=back",
+                               on_enter=self._on_dump_done, on_back=self._enter_memory)
+
+    def _on_dump_done(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        action = self._viewer_raw_items[raw_idx]
+        try:
+            if action == "heap":
+                from keytap.profiler.heap_dump import list_snapshots
+                self._heap_snaps = list_snapshots()
+                self._open_heap(self._heap_snaps[0], None)
+            elif action == "hprof":
+                from keytap.profiler.hprof_dump import list_snapshots
+                self._open_hprof(list_snapshots()[0])
+            elif action == "back":
+                self._enter_memory()
+        except Exception as e:
+            self._set_trace_viewer("Snapshot", [(f"  error: {str(e)[:100]}", None)],
+                                   "Esc=back", on_back=self._enter_memory)
+
+    # ── Detail snapshots (full HPROF) ─────────────────────────────────────────
+
+    @staticmethod
+    def _hex_id(rid):
+        return f"0x{rid & 0xffffffff:08x}"
+
+    @staticmethod
+    def _chunks(text, n=100):
+        text = text.replace("\n", "\\n").replace("\r", "")
+        return [text[i:i + n] for i in range(0, len(text), n)] or [""]
+
+    def _enter_hprof_list(self):
+        self._hp_meta = None
+        try:
+            from keytap.profiler.hprof_dump import list_snapshots
+            snaps = list_snapshots()
+        except Exception:
+            snaps = []
+        if not snaps:
+            self._set_trace_viewer("Detail Snapshots", [("  No detail snapshots found", None)],
+                                   "Esc=back", on_back=self._enter_memory)
+            return
+        rows = [(f"  {s.get('started_at', '')[5:16]}  {s.get('size', 0) / (1 << 20):>5.0f}MB  "
+                 f"{s.get('package', '')}  {s.get('label', '')}", s) for s in snaps]
+        self._set_trace_viewer("Detail Snapshots", rows,
+                               f"{len(rows)} detail snapshots  |  Enter=open  Esc=back",
+                               on_enter=self._on_hprof_snapshot, on_back=self._enter_memory)
+
+    def _on_hprof_snapshot(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx < len(self._viewer_raw_items):
+            self._open_hprof(self._viewer_raw_items[raw_idx])
+
+    def _open_hprof(self, meta):
+        self._hp_meta, self._hp_data = meta, None
+        cache = meta["path"] + ".detail.json"
+        if os.path.isfile(cache) and os.path.getmtime(cache) >= os.path.getmtime(meta["path"]):
+            with open(cache) as f:
+                cached = json.load(f)
+            if cached.get("version") == 2:   # hprof_analysis.CACHE_VERSION; older layouts are re-analysed
+                self._hp_data = cached
+                self._show_hprof_home()
+                return
+        self._set_trace_viewer("Detail Snapshot",
+                               [("  analyzing dump...  (about 5 seconds, then cached)", None)],
+                               "Esc=back", on_back=self._enter_hprof_list)
+        threading.Thread(target=self._bg_hprof, args=(meta,), daemon=True).start()
+
+    def _bg_hprof(self, meta):
+        data, err = None, None
+        try:
+            res = subprocess.run(module_command("keytap.profiler.hprof_analysis", meta["path"]),
+                                 capture_output=True, timeout=600, env=child_env())
+            if res.returncode != 0:
+                err = res.stderr.decode(errors="replace").strip().splitlines()[-1][:90]
+            else:
+                with open(meta["path"] + ".detail.json") as f:
+                    data = json.load(f)
+        except Exception as e:
+            err = str(e)
+        self.root.after(0, lambda: self._on_hprof_ready(meta, data, err))
+
+    def _on_hprof_ready(self, meta, data, err):
+        if self._hp_meta is not meta:
+            return
+        if err:
+            self._set_trace_viewer("Detail Snapshot", [(f"  error: {err}", None)],
+                                   "Esc=back", on_back=self._enter_hprof_list)
+            return
+        self._hp_data = data
+        self._show_hprof_home()
+
+    def _show_hprof_home(self):
+        d, m = self._hp_data, self._hp_meta
+        acts = d["activities"]
+        stale = sum(1 for a in acts if a["destroyed"] or a["finished"])
+        rows_on_screen = sum(len(r["rows"]) for r in d["recyclers"])
+        bms = d["bitmaps"]
+        oversized = sum(1 for b in bms if b["ratio"] and b["ratio"] >= 1.5)
+        s = d["strings"]
+        rows = [
+            (f"  {m.get('package', '')}  {m.get('label', '')}  ({m.get('size', 0) / (1 << 20):.0f}MB dump)", None),
+            (f"  Activities        - {len(acts)} alive, {stale} destroyed or finished but still in memory", "activities"),
+            (f"  RecyclerViews     - {len(d['recyclers'])} lists, {rows_on_screen} rows alive", "recyclers"),
+            (f"  Bitmaps           - {len(bms)}, {sum(1 for b in bms if b['url'])} with source URL, "
+             f"{oversized} much larger than their view", "bitmaps"),
+            (f"  Duplicate strings - {s['dup_strings']} values, {s['extra_copies']} extra copies, "
+             f"{self._fmt_bytes(s['wasted_bytes'])} wasted", "strings"),
+        ]
+        self._set_trace_viewer("Detail Snapshot", rows, "Enter=open  Esc=back",
+                               on_enter=self._on_hprof_home, on_back=self._enter_hprof_list)
+
+    def _on_hprof_home(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items):
+            return
+        {"activities": self._show_hprof_activities, "recyclers": self._show_hprof_recyclers,
+         "bitmaps": self._show_hprof_bitmaps, "strings": self._show_hprof_strings
+         }.get(self._viewer_raw_items[raw_idx], lambda: None)()
+
+    def _show_hprof_activities(self):
+        acts = sorted(self._hp_data["activities"], key=lambda a: not (a["destroyed"] or a["finished"]))
+        per_cls = collections.Counter(a["cls"] for a in acts)
+        rows = []
+        for a in acts:
+            if a["destroyed"] or a["finished"]:
+                state = "LEAKED?"
+            elif a["resumed"]:
+                state = "resumed"
+            elif a["stopped"]:
+                state = "stopped"
+            else:
+                state = "paused"
+            note = f"  x{per_cls[a['cls']]} instances" if per_cls[a["cls"]] > 1 else ""
+            rows.append((f"  {state:<9} {a['cls']}{note}", None))
+        if not rows:
+            rows = [("  no Activity instances in this dump", None)]
+        self._set_trace_viewer("Activities", rows,
+                               "LEAKED? = destroyed or finished but still in memory  |  Esc=back",
+                               on_back=self._show_hprof_home)
+
+    def _show_hprof_recyclers(self):
+        rows = []
+        for rv in self._hp_data["recyclers"]:
+            rows.append((f"  {self._hex_id(rv['id'])}  {rv['w']}x{rv['h']:<5} {rv['adapter']:<10} "
+                         f"rows {len(rv['rows'])}  cached {rv['cached']}  pooled {rv['pooled']}", rv))
+        if not rows:
+            rows = [("  no RecyclerViews in this dump", None)]
+        self._set_trace_viewer("RecyclerViews", rows,
+                               "id, size, adapter, live row views  |  Enter=row contents  Esc=back",
+                               on_enter=self._on_hprof_recycler, on_back=self._show_hprof_home)
+
+    def _on_hprof_recycler(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items) or not isinstance(self._viewer_raw_items[raw_idx], dict):
+            return
+        rv = self._viewer_raw_items[raw_idx]
+        rows = [(f"  {self._hex_id(rv['id'])}  {rv['w']}x{rv['h']}  adapter {rv['adapter']}  "
+                 f"cached {rv['cached']}  pooled {rv['pooled']}  scrap {rv['scrap']}", None)]
+        if not rv["rows"]:
+            rows.append(("  no row views are attached to this RecyclerView", None))
+        for i, row in enumerate(rv["rows"]):
+            rows.append((f"  row {i}  {row['cls']}", None))
+            rows += [(f"        {t}", None) for t in row["texts"]]
+        self._set_trace_viewer("RecyclerView rows", rows, "text shown in each live row  |  Esc=back",
+                               on_back=self._show_hprof_recyclers)
+
+    def _show_hprof_bitmaps(self):
+        bms = self._hp_data["bitmaps"]
+        if self._hp_bitmap_sort == "ratio":
+            bms = sorted(bms, key=lambda b: -(b["ratio"] or 0))
+        rows = []
+        for b in bms:
+            v = b["view"]
+            vtxt = f"view {v['w']}x{v['h']}" if v else "view -"
+            rtxt = f"{b['ratio']}x" if b["ratio"] else "-"
+            flag = "OVERSIZED " if b["ratio"] and b["ratio"] >= 1.5 else ""
+            src = b["url"] or ("held by " + ", ".join(b["holders"]) if b["holders"] else "")
+            rows.append((f"  {b['size'] / (1 << 20):>5.1f}MB {b['w']}x{b['h']:<5} {vtxt:<16} {rtxt:>6} {flag}{src}", b))
+        if not rows:
+            rows = [("  no bitmaps in this dump", None)]
+        self._set_trace_viewer("Bitmaps", rows,
+                               f"sort: {self._hp_bitmap_sort} (Cmd+S)  |  ratio = bitmap pixels / view pixels  |  "
+                               "type to filter by URL  |  Enter=details  Esc=back",
+                               on_enter=self._on_hprof_bitmap, on_back=self._show_hprof_home)
+
+    def _on_hprof_bitmap(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items) or not isinstance(self._viewer_raw_items[raw_idx], dict):
+            return
+        b = self._viewer_raw_items[raw_idx]
+        rows = [(f"  {b['w']}x{b['h']}  {b['size'] / (1 << 20):.1f}MB decoded (4 bytes per pixel)", None)]
+        v = b["view"]
+        if v:
+            rows.append((f"  shown in {v['cls']}  id {self._hex_id(v['id'])}  {v['w']}x{v['h']}", None))
+            if b["ratio"]:
+                rows.append((f"  bitmap has {b['ratio']}x the pixels of its view", None))
+        else:
+            rows.append(("  no ImageView found holding it (Compose, drawable cache or other holder)", None))
+        rows.append(("  source URL:", None))
+        rows += [(f"    {c}", None) for c in self._chunks(b["url"])] if b["url"] else [("    not found", None)]
+        if b["holders"]:
+            rows.append(("  held by: " + ", ".join(b["holders"]), None))
+        self._set_trace_viewer("Bitmap", rows, "Esc=back", on_back=self._show_hprof_bitmaps)
+
+    def _show_hprof_strings(self):
+        s = self._hp_data["strings"]
+        rows = [(f"  {s['distinct']:,} distinct strings, {s['dup_strings']} with duplicates, "
+                 f"{s['extra_copies']} extra copies", None),
+                (f"  {'wasted':>9} {'copies':>7} {'size/copy':>10}  value", None)]
+        for e in s["top"]:
+            wasted = (e["count"] - 1) * e["bytes"]
+            preview = e["value"][:80].replace("\n", " ")
+            rows.append((f"  {self._fmt_bytes(wasted):>9} x{e['count']:<6} {self._fmt_bytes(e['bytes']):>10}  {preview}", e))
+        self._set_trace_viewer("Duplicate strings", rows,
+                               "wasted = extra copies x size/copy (character data only)  |  type to filter  |  Enter=full value  Esc=back",
+                               on_enter=self._on_hprof_string, on_back=self._show_hprof_home)
+
+    def _on_hprof_string(self, lb_idx):
+        raw_idx = self._resolve_raw_idx(lb_idx)
+        if raw_idx >= len(self._viewer_raw_items) or not isinstance(self._viewer_raw_items[raw_idx], dict):
+            return
+        e = self._viewer_raw_items[raw_idx]
+        rows = [(f"  {e['count']} copies, {self._fmt_bytes(e['bytes'])} each ({e['len']:,} chars), "
+                 f"{self._fmt_bytes((e['count'] - 1) * e['bytes'])} wasted", None)]
+        if e["len"] > len(e["value"]):
+            rows.append((f"  showing first {len(e['value'])} of {e['len']} chars", None))
+        rows += [(f"  {c}", None) for c in self._chunks(e["value"])]
+        self._set_trace_viewer("String value", rows, "Esc=back", on_back=self._show_hprof_strings)
+
+    def _enter_capture_settings(self):
+        self.state = "capture-settings"
+        self._var.set("")
+        self._prompt.config(text="capture  >")
+        self._footer.config(text="Enter=apply  Esc=back")
+        cur_br  = str(self.data.get("capture_bitrate", "20000000"))
+        cur_ll  = bool(self.data.get("capture_low_latency", False))
+        cur_fps = int(self.data.get("capture_fps_cap", 0))
+        items = []
+        for label, val in _BITRATE_PRESETS:
+            dot = "●" if val == cur_br else " "
+            items.append((f"  {dot}  Bitrate: {label}", "cap-bitrate", val))
+        dot = "●" if cur_ll else " "
+        ll_str = "ON" if cur_ll else "OFF"
+        items.append((f"  {dot}  Low Latency: {ll_str}", "cap-latency", "toggle"))
+        for label, val in _FPS_PRESETS:
+            dot = "●" if val == cur_fps else " "
+            items.append((f"  {dot}  FPS Cap: {label}", "cap-fps", val))
+        cur_es = float(self.data.get("capture_encode_scale", 1.0))
+        for label, val in _ENCODE_SCALE_PRESETS:
+            dot = "●" if val == cur_es else " "
+            items.append((f"  {dot}  Encode Size: {label}", "cap-encode-scale", val))
+        cur_sv = bool(self.data.get("capture_stats_visible", False))
+        dot = "●" if cur_sv else " "
+        sv_str = "ON" if cur_sv else "OFF"
+        items.append((f"  {dot}  Stats Overlay: {sv_str}", "cap-stats", "toggle"))
+        self._shown = items
+        self._set_items(items)
+
+    # ── Emit ──────────────────────────────────────────────────────────────────
+
+    def _emit(self, result):
+        self.result = result
+        if getattr(self.root, '_persistent', False):
+            # Persistent mode: hide window and write result line to stdout.
+            # The process stays alive for the next open.
+            print(json.dumps(result), flush=True)
+            self.root.withdraw()
+        else:
+            self.root.destroy()
+
+
+# ── Viewer window ─────────────────────────────────────────────────────────────
+
+class ViewerWindow:
+    W, H = 600, 500
+
+    def __init__(self, root, data):
+        self.root   = root
+        self.result = None
+        title = data.get("title", "Viewer")
+        items = data.get("items", [])   # [[key, val], ...] or [str, ...]
+
+        root.title(f"keytap – {title}")
+        root.geometry(f"{self.W}x{self.H}")
+        root.configure(bg=C['bg'])
+        root.resizable(True, True)
+        root.attributes("-topmost", True)
+
+        # Search bar
+        bar = tk.Frame(root, bg=C['bg2'])
+        bar.pack(fill="x")
+        tk.Label(bar, text=">", bg=C['bg2'], fg=C['accent'],
+                 font=FONT_MONO, padx=8, pady=8).pack(side="left")
+        self._var = tk.StringVar()
+        tk.Entry(bar, textvariable=self._var, bg=C['bg2'], fg=C['fg'],
+                 insertbackground=C['fg'], font=FONT_MONO,
+                 relief="flat", bd=0).pack(side="left", fill="x",
+                                           expand=True, pady=8, padx=(0,8))
+        tk.Frame(root, bg=C['border'], height=1).pack(fill="x")
+
+        # List (key – value)
+        lf = tk.Frame(root, bg=C['bg'])
+        lf.pack(fill="both", expand=True)
+        sb = tk.Scrollbar(lf, orient="vertical", bg=C['bg'], width=6)
+        self._lb = tk.Listbox(lf, bg=C['bg'], fg=C['fg'],
+                              selectbackground=C['sel'], selectforeground=C['sel_fg'],
+                              font=FONT_SMALL, relief="flat", bd=0,
+                              activestyle="none", highlightthickness=0,
+                              yscrollcommand=sb.set)
+        sb.config(command=self._lb.yview)
+        sb.pack(side="right", fill="y")
+        self._lb.pack(fill="both", expand=True)
+
+        tk.Frame(root, bg=C['border'], height=1).pack(fill="x")
+        tk.Label(root, text=f"{title}  |  Esc=close",
+                 bg=C['bg2'], fg=C['dim'],
+                 font=FONT_SMALL, anchor="w", padx=12, pady=6).pack(fill="x")
+
+        # Normalise items
+        self._all = []
+        for it in items:
+            if isinstance(it, (list, tuple)) and len(it) == 2:
+                k, v = str(it[0]), str(it[1])
+                self._all.append(f"  {k}  =  {v}")
+            else:
+                self._all.append(f"  {it}")
+
+        self._refresh()
+        self._var.trace_add("write", lambda *_: self._refresh())
+
+        root.bind("<Escape>", lambda _: self._close())
+        root.protocol("WM_DELETE_WINDOW", self._close)
+
+    def _refresh(self):
+        q = self._var.get().lower()
+        self._lb.delete(0, "end")
+        for line in self._all:
+            if not q or q in line.lower():
+                self._lb.insert("end", line)
+
+    def _close(self):
+        self.root.destroy()
+
+
+# ── Persistent mode ───────────────────────────────────────────────────────────
+
+_u2_dev = None  # cached uiautomator2 device
+_u2_lock = threading.Lock()
+
+
+def _get_u2_dev(serial):
+    """Return a live u2 device, reconnecting if the cached one is stale."""
+    global _u2_dev
+    with _u2_lock:
+        if _u2_dev is not None:
+            try:
+                _u2_dev.info  # lightweight health-check (HTTP ping to ATX agent)
+                return _u2_dev
+            except Exception:
+                _log.debug("u2 device stale, reconnecting...")
+                _u2_dev = None
+        try:
+            import uiautomator2 as u2
+            _u2_dev = u2.connect(serial) if serial else u2.connect()
+            _log.debug("u2 connected, serial=%r", serial)
+            return _u2_dev
+        except Exception as e:
+            _log.warning("u2 connect failed: %s", e)
+            return None
+
+
+def _preconnect_u2(serial):
+    _get_u2_dev(serial)  # warms the cache; result stored in _u2_dev by _get_u2_dev
+
+
+def _setup_logging():
+    logging.basicConfig(
+        filename=_LOG_FILE,
+        level=logging.DEBUG,
+        format="%(asctime)s %(name)-22s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
+def _persistent_main():
+    """Keep process alive. On each JSON line from stdin, re-open the palette.
+    Python + tkinter are already loaded, so the window appears with no startup lag.
+    Results are written line-by-line to stdout; __ready__ signals warm state via stderr."""
+    _setup_logging()
+    root = tk.Tk()
+    root.withdraw()          # start hidden
+    root._persistent = True  # signals _emit() to hide instead of destroy
+
+    # Pre-connect u2 in background — serial passed via --serial CLI arg
+    try:
+        from keytap.core.config import ARGS as _cfg_args
+        _serial = _cfg_args.serial
+    except Exception:
+        _serial = None
+    threading.Thread(target=_preconnect_u2, args=(_serial,), daemon=True).start()
+
+    sys.stderr.write("__ready__\n")
+    sys.stderr.flush()
+
+    palette_holder = [None]
+
+    def _do_open(data):
+        # Destroy previous palette widgets so __init__ can rebuild cleanly.
+        for widget in root.winfo_children():
+            widget.destroy()
+        root.deiconify()
+        palette_holder[0] = PaletteWindow(root, data)
+
+    def _stdin_loop():
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+                root.after(0, lambda d=data: _do_open(d))
+            except Exception:
+                pass
+
+    threading.Thread(target=_stdin_loop, daemon=True).start()
+    root.mainloop()
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    _setup_logging()
+    if "--persistent" in sys.argv:
+        _persistent_main()
+        return
+
+    raw = sys.stdin.readline()
+    if not raw.strip():
+        print("null")
+        return
+
+    data = json.loads(raw)
+    mode = data.get("mode", "palette")
+
+    root = tk.Tk()
+
+    if mode == "viewer":
+        w = ViewerWindow(root, data)
+        root.mainloop()
+        # viewer doesn't return an action
+        print("null")
+    else:
+        w = PaletteWindow(root, data)
+        root.mainloop()
+        print(json.dumps(w.result))
+
+    sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()
