@@ -181,8 +181,9 @@ def main():
                      help="run the recording N times in a row (default: 1)")
     run.add_argument("--serial", metavar="ID",
                      help="adb serial of the phone (default: the only attached phone)")
-    run.add_argument("--mode", choices=["fast", "timed"], default="fast",
-                     help="fast: 0.3s between steps. timed: keep the pauses of the recording (default: fast)")
+    run.add_argument("--mode", choices=["fast", "timed"], default="timed",
+                     help="timed: keep the pauses of the recording, each capped at 10s. "
+                          "fast: 0.3s between steps (default: timed)")
     wait = ap.add_argument_group("waiting and retries")
     wait.add_argument("--wait", type=float, default=10.0, metavar="SECONDS",
                       help="element taps wait as long as the recording did, then keep looking this many "
