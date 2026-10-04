@@ -29,6 +29,7 @@ EPILOG = """examples:
   ./replay.py                                  list the recordings
   ./replay.py commsFE_v2                       run one recording once
   ./replay.py commsFE_v2 --repeat 10           run it 10 times and see what is flaky
+  ./replay.py commsFE_v2 --repeat 10 --quiet   final summary only, for scripts and Claude
   ./replay.py latest --reset stop              newest recording, app force-stopped first
   ./replay.py commsFE_v2 --retries 1 --wait 20 forgive one slow step, wait longer for elements
 
@@ -143,7 +144,8 @@ def _run_once(rec, args, run_dir, package, health):
     log = open(os.path.join(run_dir, "replay.log"), "w")
 
     def on_status(msg):
-        print("  " + msg, flush=True)
+        if not args.quiet:
+            print("  " + msg, flush=True)
         log.write(msg + "\n")
 
     rep = ActionReplayer()
@@ -199,6 +201,8 @@ def main():
                        help="app to reset (default: the first package in the recording)")
     state.add_argument("--network", action="store_true",
                        help="serve the recorded network responses (needs a full-dump recording)")
+    ap.add_argument("--quiet", action="store_true",
+                    help="print only the final summary (progress goes to run_NN/replay.log)")
     ap.add_argument("--out", metavar="DIR", help="results folder (default: data/runs/<name>_<time>)")
     args = ap.parse_args()
 
@@ -254,7 +258,8 @@ def main():
 
     results = []
     for n in range(1, args.repeat + 1):
-        print(f"run {n}/{args.repeat}: {rec.name}", flush=True)
+        if not args.quiet:
+            print(f"run {n}/{args.repeat}: {rec.name}", flush=True)
         health = _device_ready(args.serial)
         if health is None:
             print("  device not reachable")
@@ -273,7 +278,8 @@ def main():
                 net.stop()
         results.append(result)
         verdict = "pass" if result["success"] else "FAIL: " + result["failure"]["cause"]
-        print(f"  {verdict}  ({result['duration_s']}s)", flush=True)
+        if not args.quiet:
+            print(f"  {verdict}  ({result['duration_s']}s)", flush=True)
     if net:
         net.shutdown()
 
@@ -294,7 +300,7 @@ def main():
         json.dump(summary, f, indent=2)
 
     print(f"\n{passed}/{len(results)} passed" + ("  (flaky)" if summary["flaky"] else ""))
-    if steps:
+    if steps and not args.quiet:
         print(f"total {total['min_s']} / {total['median_s']} / {total['max_s']} s  (min / median / max)")
         for st in steps:
             print(f"  {st['step']}. {st['label'][:38]:<38} {st['min_ms']:>6} {st['median_ms']:>7.0f} {st['max_ms']:>6} ms")

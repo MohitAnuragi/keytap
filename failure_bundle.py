@@ -18,10 +18,13 @@ import re
 import xml.etree.ElementTree as ET
 
 from adb import adb, take_screencap
+from elements import parse_elements
 from utils import adb_shell
 
 _FOCUS_RE = re.compile(r"u\d+\s+([\w.]+)/([\w.$]+)")
 _PNG = b"\x89PNG"
+MAX_CLICKABLE = 30   # tappable elements listed in failure.json
+MAX_TEXT = 80        # longer texts (chat messages) are left out; they make poor selectors
 
 
 def _hierarchy(dev) -> str:
@@ -40,8 +43,9 @@ def _hierarchy(dev) -> str:
 
 
 def _screen(xml: str) -> dict:
-    """The resource ids and texts on screen, so the failure shows where the app was."""
-    ids, texts = [], []
+    """What is on screen: all resource ids and texts, and the tappable elements with the fields
+    a replacement selector needs (full resource_id, content_desc, text, index when ambiguous)."""
+    ids, texts, clickable = [], [], []
     try:
         for node in ET.fromstring(xml).iter("node"):
             rid = node.get("resource-id", "").split("/")[-1]
@@ -50,9 +54,17 @@ def _screen(xml: str) -> dict:
             txt = node.get("text", "")
             if txt and txt not in texts:
                 texts.append(txt)
+        for el in parse_elements(xml):
+            item = {k: el[k] for k in ("resource_id", "content_desc") if el[k]}
+            if el["text"] and len(el["text"]) <= MAX_TEXT:
+                item["text"] = el["text"]
+            if item:
+                if el["index"] is not None:
+                    item["index"] = el["index"]
+                clickable.append(item)
     except ET.ParseError:
         pass
-    return {"ids": ids[:20], "texts": texts[:12]}
+    return {"ids": ids[:20], "texts": texts[:12], "clickable": clickable[:MAX_CLICKABLE]}
 
 
 def _crash(logcat: str, package: str) -> str:

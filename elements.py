@@ -44,6 +44,12 @@ def dump_elements(serial=None):
     xml_raw = d.dump_hierarchy()
     xml_str = xml_raw if isinstance(xml_raw, str) else xml_raw.decode()
 
+    return parse_elements(xml_str)
+
+
+def parse_elements(xml_str):
+    """Interactive elements (clickable or focusable) of a hierarchy dump, in document order,
+    with the selector index described in dump_elements. Raises ET.ParseError on bad XML."""
     root = ET.fromstring(xml_str)
     elements = []
     bounds_index = {}  # bounds -> index in elements; used to replace layouts with widgets
