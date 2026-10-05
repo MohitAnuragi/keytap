@@ -125,7 +125,7 @@ keytap --backend screenrecord   # fallback capture
 keytap.py  replay.py  suite.py     commands, thin wrappers (run them from the keytap folder)
 install.sh  bootstrap.sh           install and one-liner setup
 docs/                              roadmaps and design notes
-skills/                            the harden-recording Claude skill (install.sh copies it to ~/.claude)
+skills/                            the harden-recording and harden-suite Claude skills (install.sh copies it to ~/.claude)
 data/  suites/                     your recordings, traces, heap dumps and test suites (gitignored)
 keytap/                            the Python package
   core/       config, paths, settings, utils, fonts

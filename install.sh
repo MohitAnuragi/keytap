@@ -2,7 +2,7 @@
 # keytap install script
 # Installs Python dependencies, checks system tools, registers the
 # `keytap` shell command in your ~/.zshrc or ~/.bash_profile, and installs the
-# harden-recording Claude skill into ~/.claude/skills so it works from any folder.
+# Claude skills (harden-recording, harden-suite) into ~/.claude/skills so it works from any folder.
 #
 # Usage:
 #   bash install.sh               # full install
@@ -25,21 +25,21 @@ error() { echo -e "${RED}[keytap]${NC} $*"; }
 
 # ── Claude skill ──────────────────────────────────────────────────────────────
 
-# Copies skills/harden-recording to ~/.claude/skills and writes this keytap folder's path into
+# Copies every folder in skills/ to ~/.claude/skills and writes this keytap folder's path into
 # it, so Claude can find replay.py when it is not started inside the keytap folder.
 install_skill() {
-    local src="$KEYTAP_DIR/skills/harden-recording"
-    local dst="$HOME/.claude/skills/harden-recording"
-    if [[ ! -d "$src" ]]; then
-        warn "skill not found at $src, skipping"
-        return 0
-    fi
-    rm -rf "$dst"
-    mkdir -p "$dst"
-    cp -R "$src/." "$dst/"
-    find "$dst" -name '*.md' -exec sed -i.bak "s|__KEYTAP_DIR__|$KEYTAP_DIR|g" {} +
-    find "$dst" -name '*.bak' -delete
-    info "Installed Claude skill harden-recording to $dst"
+    local src name dst
+    for src in "$KEYTAP_DIR"/skills/*/; do
+        [[ -f "$src/SKILL.md" ]] || continue
+        name="$(basename "$src")"
+        dst="$HOME/.claude/skills/$name"
+        rm -rf "$dst"
+        mkdir -p "$dst"
+        cp -R "$src." "$dst/"
+        find "$dst" -name '*.md' -exec sed -i.bak "s|__KEYTAP_DIR__|$KEYTAP_DIR|g" {} +
+        find "$dst" -name '*.bak' -delete
+        info "Installed Claude skill $name to $dst"
+    done
 }
 
 if [[ "${1:-}" == "--skill-only" ]]; then
@@ -183,6 +183,6 @@ echo "      keytap --height 1000          # taller mirror window"
 echo "      keytap --backend screenrecord # fallback capture"
 echo "      keytap --serial emulator-5554 # target specific device"
 echo ""
-echo "  Claude skill (harden a flaky recording): in Claude Code, ask it to harden a keytap recording,"
+echo "  Claude skill (harden a recording, build a test suite): in Claude Code, ask it to harden a keytap recording or build a suite,"
 echo "  or run: ./replay.py --help"
 echo ""
