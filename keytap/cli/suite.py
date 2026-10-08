@@ -31,18 +31,20 @@ EPILOG = """suite folder:
 
 suite.json:
   {"package": "com.example.app",
-   "login":   {"flow": "flows/login", "default": "once", "check": {"content_desc": "Home"}},
+   "login":   {"flow": "flows/login", "default": "once", "check": [{"content_desc": "Finance"}, {"content_desc": "QRIS"}],
+               "params": {"phone": "9999999999"}},   default login params, a test's login_params override them
    "before_each": "restart",                 restart (force-stop and launch) or none
    "tests": "tests/*",                       a glob (alphabetical) or a list (run in that order)
    "defaults": {"wait": 10, "retries": 1}}   same as the replay.py flags
 
 login policy, per test (header "login") or suite default:
   once     log in only when the phone is not logged in; the session is kept between tests.
-           "check" is a selector that is visible only when logged in; without it the runner
+           "check" is a selector (or a list, all must show) visible only when logged in; without it the runner
            trusts its own record of the login. It waits up to "check_timeout" seconds (default 20,
            a cold start) for it before deciding the phone is logged out
   always   wipe the app's data, then log in before this test
   never    no login (tests of the logged-out screens)
+  A "once" test whose login params differ from the last login wipes the app's data and logs in again.
 
 results (<dir>/.runs/<time>/):
   summary.json    every test: status, cause, detail, failure folder, screenshot
@@ -252,13 +254,15 @@ def _push_screenshot(fdir, out, name):
 
 
 def _is_logged_in(dev, check, timeout_s):
+    """check is one selector or a list; all of them must be on screen at the same time."""
     from keytap.device import lookup
     from keytap.recorder.recording import ElementSelector
-    sel = ElementSelector(**{k: v for k, v in check.items() if k in SELECTOR_KEYS})
+    checks = check if isinstance(check, list) else [check]
+    sels = [ElementSelector(**{k: v for k, v in c.items() if k in SELECTOR_KEYS}) for c in checks]
     deadline = time.time() + timeout_s
     while True:
         try:
-            if lookup.find_element(dev, sel) is not None:
+            if all(lookup.find_element(dev, sel) is not None for sel in sels):
                 return True
         except Exception:
             pass
@@ -271,6 +275,7 @@ class Runner:
     def __init__(self, root, suite, opts, args, out, say):
         self.root, self.suite, self.opts, self.args, self.out, self.say = root, suite, opts, args, out, say
         self.logged_in = None          # True, False, or None when unknown (after a failure)
+        self.account = None            # params of the last successful login, None when unknown
         self.logins = {"ran": 0, "failed": 0}
         self._dev = None
 
@@ -297,9 +302,11 @@ class Runner:
             self.opts, out, package=self.suite["package"])
         if summary["failed"] == 0:
             self.logged_in = True
+            self.account = params
             return None
         self.logins["failed"] += 1
         self.logged_in = False
+        self.account = None
         f = results[0]["failure"]
         cause = f["cause"] if f["cause"] in engine.INFRA_CAUSES else "login_failed"
         detail = f["detail"] if cause == f["cause"] else f"{f['cause']}: {f['detail']}"
@@ -322,19 +329,20 @@ class Runner:
         result["login"] = policy
         before_each = header.get("before_each", suite["before_each"])
         check = suite["login"].get("check")
-        params = header.get("login_params", {})
+        params = {**suite["login"].get("params", {}), **header.get("login_params", {})}
         fdir = None
 
-        if policy == "always":
+        switch = policy == "once" and self.account is not None and self.account != params
+        if policy == "always" or switch:
             actions.clear_data(pkg)
             self.logged_in = False
-        need = policy == "always" or (policy == "once" and bool(check or self.logged_in is not True))
+        need = policy == "always" or switch or (policy == "once" and bool(check or self.logged_in is not True))
         if need and before_each == "restart":
             actions.force_stop(pkg)
             actions.launch(pkg)
-        if policy == "once" and check:
+        if policy == "once" and check and not switch:
             need = not _is_logged_in(self.dev(), check, self.suite["login"].get("check_timeout", 20))
-        elif policy == "once":
+        elif policy == "once" and not switch:
             need = self.logged_in is not True
         if need:
             result["login_ran"] = True
@@ -360,8 +368,10 @@ class Runner:
                 fdir = os.path.join(out, f"run_{bad + 1:02d}", "failure")
             if any(a.type == "clear_data" for a in rec.actions):
                 self.logged_in = False
+                self.account = None
             if result["status"] != "pass":
                 self.logged_in = None   # unknown now: verify with the login check, or log in again
+                self.account = None
 
         result["duration_s"] = round(time.time() - started, 1)
         if fdir and os.path.isdir(fdir):
