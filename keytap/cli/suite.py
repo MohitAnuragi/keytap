@@ -409,7 +409,8 @@ def cmd_run(args):
         print(e)
         return 2
     if args.names:
-        tests = [t for t in tests if any(n.lower() in t["name"].lower() for n in args.names)]
+        tests = [t for t in tests if any(n == t["name"] if args.exact else n.lower() in t["name"].lower()
+                                         for n in args.names)]
     if args.tag:
         tests = [t for t in tests if args.tag in (_read_json(os.path.join(t["path"], "actions.json")).get("tags") or [])]
     if not tests:
@@ -528,6 +529,7 @@ def main():
     p = sub.add_parser("run", help="run the tests, write results to <dir>/.runs/<time>/")
     p.add_argument("dir")
     p.add_argument("names", nargs="*", help="only tests whose name contains one of these")
+    p.add_argument("--exact", action="store_true", help="names must equal a test's name, not just be part of it")
     p.add_argument("--tag", help="only tests with this tag")
     p.add_argument("--repeat", type=int, default=1, metavar="N", help="run each test N times (default: 1)")
     p.add_argument("--login", choices=["once", "always", "never"], help="force one login policy for every test")
