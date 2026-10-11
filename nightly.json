@@ -1,0 +1,6 @@
+{
+  "suites": ["suites/gopay_smoke"],
+  "max_hours": 7,
+  "min_battery": 20,
+  "model": "gemma4:12b"
+}
