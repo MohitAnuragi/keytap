@@ -121,7 +121,7 @@ class ActionReplayer:
 
         # Pre-connect u2 once for the whole replay if any step looks up elements
         self._u2_error = ""
-        if any(a.type in ("element_tap", "scroll_to", "assert") or a.when for a in recording.actions):
+        if any(a.type in ("element_tap", "scroll_to", "assert") or a.when or a.verify for a in recording.actions):
             try:
                 import uiautomator2 as u2
                 self._u2_dev = u2.connect(serial) if serial else u2.connect()
@@ -194,6 +194,22 @@ class ActionReplayer:
         on_status(f"replay done  ({total} actions)")
         on_done(success=True, step=total, error=None)
 
+    def _verify_typed(self, text: str):
+        """adb "input text" can drop characters. Read the focused field and, if it differs, set the text
+        directly (up to 2 times)."""
+        found = None
+        for attempt in range(3):
+            time.sleep(0.5)
+            field = self._u2_dev(focused=True)
+            found = field.get_text() if field.exists else None
+            if found == text:
+                return True, None
+            if attempt < 2 and field.exists:
+                if self._on_status:
+                    self._on_status(f"[RETYPE {attempt + 1}/2] field has {found!r}, setting {text!r}")
+                field.set_text(text)
+        return False, f"typed text did not reach the field: wanted {text!r}, found {found!r}"
+
     def _when_skips(self, action: Action):
         """(why the step is skipped or None, ok, error). A step with "when" runs only if that element
         shows up in time; its when_span steps (a whole flow, for a run step) are skipped together."""
@@ -250,6 +266,8 @@ class ActionReplayer:
                           duration=action.duration or 300)
         elif t == "input_text":
             actions.input_text(action.text)
+            if action.verify and self._u2_dev is not None:
+                return self._verify_typed(action.text)
         elif t == "launch":
             actions.launch(action.package)
         elif t == "launch_deeplink":

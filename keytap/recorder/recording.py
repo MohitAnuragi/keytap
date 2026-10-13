@@ -73,6 +73,9 @@ class Action:
     when: Optional[dict] = None
     when_timeout_ms: Optional[int] = None
     when_span: Optional[int] = None
+    # input_text only: after typing, read the focused field and set the text directly if characters were
+    # dropped (adb "input text" drops some on a busy phone). Not for password or OTP fields, which hide it.
+    verify: Optional[bool] = None
     # element_tap only: selector of what the tap should bring up; if it is not on screen 3s after the
     # tap, tap again (up to 2 more times). Better than retap_if_unchanged on screens that animate.
     expect: Optional[dict] = None
@@ -232,7 +235,7 @@ class Recording:
                 check=a.get("check"), value=a.get("value"), soft=a.get("soft"),
                 optional=a.get("optional"),
                 when=a.get("when"), when_timeout_ms=a.get("when_timeout_ms"), when_span=a.get("when_span"),
-                expect=a.get("expect"),
+                expect=a.get("expect"), verify=a.get("verify"),
                 retap_if_unchanged=a.get("retap_if_unchanged"),
                 flow=a.get("flow"), params=a.get("params"),
                 secret=a.get("secret"), origin=a.get("origin"),
