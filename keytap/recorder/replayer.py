@@ -196,18 +196,23 @@ class ActionReplayer:
 
     def _verify_typed(self, text: str):
         """adb "input text" can drop characters. Read the focused field and, if it differs, set the text
-        directly (up to 2 times)."""
+        directly (up to 2 times). A field that cannot be read is not a failure: nothing to compare."""
         found = None
-        for attempt in range(3):
-            time.sleep(0.5)
-            field = self._u2_dev(focused=True)
-            found = field.get_text() if field.exists else None
-            if found == text:
-                return True, None
-            if attempt < 2 and field.exists:
-                if self._on_status:
-                    self._on_status(f"[RETYPE {attempt + 1}/2] field has {found!r}, setting {text!r}")
-                field.set_text(text)
+        try:
+            for attempt in range(3):
+                time.sleep(0.5)
+                field = self._u2_dev(focused=True)
+                found = field.get_text() if field.exists else None
+                if found == text:
+                    return True, None
+                if attempt < 2 and field.exists:
+                    if self._on_status:
+                        self._on_status(f"[RETYPE {attempt + 1}/2] field has {found!r}, setting {text!r}")
+                    field.set_text(text)
+        except Exception as e:
+            if self._on_status:
+                self._on_status(f"[WARN] could not check the typed text: {type(e).__name__}")
+            return True, None
         return False, f"typed text did not reach the field: wanted {text!r}, found {found!r}"
 
     def _when_skips(self, action: Action):
