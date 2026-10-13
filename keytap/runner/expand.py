@@ -6,8 +6,13 @@ Loading actions.json with `run` steps expanded and placeholders filled in.
 Placeholders in any string of an action:
   {{name}}       a param given by the run step (or the test's login_params)
   {{ts}}         a timestamp, the same for the whole run, different each run (unique test text)
+  {{package}}    the "package" of the suite's suite.json, unless a run step passes its own package param
   {{env:NAME}}   an environment variable, so credentials never live in files. An input_text that
                  used one is marked secret and shown as *** in logs.
+
+"when": {selector} on any step (or run step) runs it only if that element shows up within
+"when_timeout_ms" (default 8000), else skips it. On a run step it guards the whole flow, decided once
+when the flow starts, so the flow's own taps may make the element vanish.
 
 Flows are folders with an actions.json, found relative to the suite folder (the nearest parent
 holding suite.json). Includes may nest 3 deep; loops are an error.
@@ -116,6 +121,8 @@ def _expand(path, root, params, vars_, resolve_env, strict, stack):
             if stack:
                 a["origin"] = f"{name} step {k}"
             a["t"] = a.get("t", 0) + shift
+            if a.get("when"):
+                a.setdefault("when_span", 1)
             out.append(a)
             continue
         flow = _flow_dir(a.get("flow", ""), root)
@@ -126,6 +133,10 @@ def _expand(path, root, params, vars_, resolve_env, strict, stack):
             raise LoadError(f"flows nested deeper than {MAX_DEPTH}: {' -> '.join(os.path.basename(p) for p in stack)}")
         _, inner = _expand(flow, root, {**params, **(a.get("params") or {})}, vars_,
                            resolve_env, strict, stack + (os.path.normpath(path),))
+        if a.get("when") and inner:
+            if inner[0].get("when"):
+                raise LoadError(f'run step "{a["flow"]}": has "when", and its first step has one too')
+            inner[0].update(when=a["when"], when_span=len(inner), when_timeout_ms=a.get("when_timeout_ms"))
         start = a.get("t", 0) + shift
         for ia in inner:
             ia["t"] += start
@@ -141,8 +152,12 @@ def load_recording(path, root=None, params=None, vars_=None, resolve_env=True, s
     resolve_env=False and strict=False are for `suite.py check`, which has no secrets or params."""
     root = root or find_root(path)
     data, _ = _read(path)
-    header, actions = _expand(path, root, params or {}, vars_ if vars_ is not None else new_vars(),
-                              resolve_env, strict, ())
+    vars_ = vars_ if vars_ is not None else new_vars()
+    if root:
+        with open(os.path.join(root, "suite.json")) as f:
+            if "package" in (suite := json.load(f)):
+                vars_.setdefault("package", suite["package"])
+    header, actions = _expand(path, root, params or {}, vars_, resolve_env, strict, ())
     rec = Recording(
         name=data.get("name", os.path.basename(os.path.normpath(path))),
         recorded_at=data.get("recorded_at", ""),

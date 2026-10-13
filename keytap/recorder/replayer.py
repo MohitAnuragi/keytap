@@ -19,6 +19,7 @@ class ActionReplayer:
     FAST_DELAY_MS = 300
     RETRY_PAUSE_S = 1.0
     MAX_SCROLLS = 8
+    WHEN_TIMEOUT_MS = 8000     # how long a step's "when" element gets to show up
     MAX_RECORDED_WAIT_S = 60   # a long pause in the recording must not stall a nightly run
 
     def __init__(self):
@@ -30,6 +31,7 @@ class ActionReplayer:
         self._u2_dev = None
         self._u2_error = ""
         self._serial = None
+        self._skip_left = 0             # steps still to skip because a "when" did not hold
         self._warn = ""                 # message of a soft assertion that failed in the current step
         self.extra_wait_s = 10.0        # keep looking this long after the recorded wait
         self._recorded_wait_s = 0.0     # wait still owed for the current step (its gap in the recording)
@@ -107,6 +109,7 @@ class ActionReplayer:
     def _run_steps(self, recording, serial, on_status, on_done, device_resolution):
         self._on_status = on_status
         self._serial = serial
+        self._skip_left = 0
         actions.set_sync(True)   # each step finishes before the next starts
         total = len(recording.actions)
 
@@ -118,7 +121,7 @@ class ActionReplayer:
 
         # Pre-connect u2 once for the whole replay if any step looks up elements
         self._u2_error = ""
-        if any(a.type in ("element_tap", "scroll_to", "assert") for a in recording.actions):
+        if any(a.type in ("element_tap", "scroll_to", "assert") or a.when for a in recording.actions):
             try:
                 import uiautomator2 as u2
                 self._u2_dev = u2.connect(serial) if serial else u2.connect()
@@ -139,35 +142,40 @@ class ActionReplayer:
 
             self._current_step = i
             on_status(f"[REPLAY {i + 1}/{total}] {action_label(action)}")
-            self._wait_between(action.t, prev_t)
+            skipped, ok, error = self._when_skips(action)
+            if skipped or not ok:
+                prev_t = action.t
+            else:
+                self._wait_between(action.t, prev_t)
 
-            if self._stop_event.is_set():
-                on_status("replay stopped")
-                self.active = False
-                self._recording = None
-                return
+                if self._stop_event.is_set():
+                    on_status("replay stopped")
+                    self.active = False
+                    self._recording = None
+                    return
 
-            gap_s = min(max(action.t - prev_t, 0) / 1000, self.MAX_RECORDED_WAIT_S)
-            # timed mode already slept the gap (up to 10s) before the step
-            self._recorded_wait_s = gap_s - (min(gap_s, 10) if self.mode == "timed" else 0)
-            prev_t = action.t
+                gap_s = min(max(action.t - prev_t, 0) / 1000, self.MAX_RECORDED_WAIT_S)
+                # timed mode already slept the gap (up to 10s) before the step
+                self._recorded_wait_s = gap_s - (min(gap_s, 10) if self.mode == "timed" else 0)
+                prev_t = action.t
 
             retries = action.retries if action.retries is not None else self.default_retries
             started = time.time()
-            ok, error = self._execute_safe(action, serial)
             attempt = 0
-            while (not ok and attempt < retries and not self._stop_event.is_set()
-                   and not error.startswith("uiautomator2 unavailable")):
-                attempt += 1
-                on_status(f"[RETRY {attempt}/{retries}] step {i + 1}: {error}")
-                time.sleep(self.RETRY_PAUSE_S)
+            if not skipped and ok:
                 ok, error = self._execute_safe(action, serial)
+                while (not ok and attempt < retries and not self._stop_event.is_set()
+                       and not error.startswith("uiautomator2 unavailable")):
+                    attempt += 1
+                    on_status(f"[RETRY {attempt}/{retries}] step {i + 1}: {error}")
+                    time.sleep(self.RETRY_PAUSE_S)
+                    ok, error = self._execute_safe(action, serial)
             warn, self._warn = self._warn, ""
             entry = {
                 "step": i + 1, "label": action_label(action),
-                "status": ("warn" if warn else "pass") if ok else "fail",
+                "status": "skip" if skipped else ("warn" if warn else "pass") if ok else "fail",
                 "ms": int((time.time() - started) * 1000),
-                "retries": attempt, "error": error or warn or None,
+                "retries": attempt, "error": skipped or error or warn or None,
             }
             if action.origin:
                 entry["origin"] = action.origin
@@ -185,6 +193,27 @@ class ActionReplayer:
         self._recording = None
         on_status(f"replay done  ({total} actions)")
         on_done(success=True, step=total, error=None)
+
+    def _when_skips(self, action: Action):
+        """(why the step is skipped or None, ok, error). A step with "when" runs only if that element
+        shows up in time; its when_span steps (a whole flow, for a run step) are skipped together."""
+        if self._skip_left > 0:
+            self._skip_left -= 1
+            return "inside a block whose when did not hold", True, None
+        if not action.when:
+            return None, True, None
+        if self._u2_dev is None:
+            return None, False, self._unavailable()
+        sel = ElementSelector(**action.when)
+        timeout_s = (action.when_timeout_ms or self.WHEN_TIMEOUT_MS) / 1000
+        el, _ = self._wait_for_element(self._u2_dev, sel, timeout_s)
+        if el is not None:
+            return None, True, None
+        self._skip_left = (action.when_span or 1) - 1
+        why = f"when '{self._describe(sel)}' not on screen after {timeout_s:g}s"
+        if self._on_status:
+            self._on_status(f"[SKIP] {why}")
+        return why, True, None
 
     def _wait_between(self, action_t_ms: int, prev_t_ms: int):
         if self.mode == "step":
@@ -303,7 +332,9 @@ class ActionReplayer:
             el, last_exc = self._wait_for_element(dev, sel, timeout_s, recorded_s)
             if el is not None:
                 cx, cy = el.center()
-                if action.retap_if_unchanged:
+                if action.expect:
+                    self._tap_until_visible(dev, cx, cy, ElementSelector(**action.expect))
+                elif action.retap_if_unchanged:
                     self._tap_until_screen_changes(dev, cx, cy)
                 else:
                     actions.tap(cx, cy)
@@ -345,6 +376,19 @@ class ActionReplayer:
                              for n in root.iter("node") if n.get("package") != "com.android.systemui")
         except Exception:
             return None
+
+    def _tap_until_visible(self, dev, cx, cy, sel: ElementSelector):
+        """Tap, and if the element the tap should bring up is not on screen 3s later, tap again, up to
+        MAX_RETAPS times. Gives up quietly: the next step's own wait reports the failure."""
+        for attempt in range(1 + self.MAX_RETAPS):
+            actions.tap(cx, cy)
+            deadline = time.time() + 2 * self.RETAP_WAIT_S
+            while time.time() < deadline:
+                time.sleep(0.3)
+                if self._find_element(dev, sel) is not None:
+                    return
+            if self._on_status and attempt < self.MAX_RETAPS:
+                self._on_status(f"[RETAP {attempt + 1}/{self.MAX_RETAPS}] '{self._describe(sel)}' not on screen after tap, tapping again")
 
     def _tap_until_screen_changes(self, dev, cx, cy):
         """Tap, and if the screen is the same a moment later tap again, up to MAX_RETAPS times. Android drops

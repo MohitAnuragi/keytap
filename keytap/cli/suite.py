@@ -35,6 +35,8 @@ suite.json:
                "params": {"phone": "9999999999"}},   default login params, a test's login_params override them
    "before_each": "restart",                 restart (force-stop and launch) or none
    "tests": "tests/*",                       a glob (alphabetical) or a list (run in that order)
+   "needs": {"card_test": ["seed_test"]},    tests that must run first (listed earlier in "tests"); picking
+                                             card_test by name or --tag adds seed_test before it
    "defaults": {"wait": 10, "retries": 1}}   same as the replay.py flags
 
 login policy, per test (header "login") or suite default:
@@ -87,6 +89,9 @@ def load_suite(root):
     suite = {"tests": "tests/*", "before_each": "restart", "defaults": {}, "login": {}, **data}
     if suite["before_each"] not in ("restart", "none"):
         raise SuiteError('suite.json "before_each" must be "restart" or "none"')
+    needs = suite.get("needs", {})
+    if not isinstance(needs, dict) or not all(isinstance(v, list) for v in needs.values()):
+        raise SuiteError('suite.json "needs" must map a test name to a list of test names')
     login = suite["login"]
     if login and login.get("default", "once") not in ("once", "always", "never"):
         raise SuiteError('suite.json login "default" must be once, always or never')
@@ -98,6 +103,17 @@ def list_items(root, spec):
     paths = [os.path.join(root, p) for p in spec] if isinstance(spec, list) else sorted(glob.glob(os.path.join(root, spec)))
     return [{"name": os.path.basename(p), "path": p} for p in paths
             if os.path.isfile(os.path.join(p, "actions.json"))]
+
+
+def add_needs(all_tests, picked, needs):
+    """The picked tests plus whatever they need first (and what that needs), in the suite's order."""
+    want, todo = set(), [t["name"] for t in picked]
+    while todo:
+        n = todo.pop()
+        if n not in want:
+            want.add(n)
+            todo += needs.get(n, [])
+    return [t for t in all_tests if t["name"] in want]
 
 
 def list_flows(root):
@@ -201,6 +217,15 @@ def cmd_check(args):
         for p in suite["tests"]:
             if not os.path.isfile(os.path.join(root, p, "actions.json")):
                 report("ERROR", "suite.json", f'test "{p}" not found')
+                errors += 1
+    names = [t["name"] for t in list_items(root, suite["tests"])]
+    for test, needed in suite.get("needs", {}).items():
+        for n in needed:
+            if test not in names or n not in names:
+                report("ERROR", "suite.json", f'needs: "{test}" needs "{n}", both must be tests of this suite')
+                errors += 1
+            elif names.index(n) > names.index(test):
+                report("ERROR", "suite.json", f'needs: "{n}" must be listed before "{test}" in "tests"')
                 errors += 1
     items = [("flow", i) for i in list_flows(root)] + [("test", i) for i in list_items(root, suite["tests"])]
     if not any(k == "test" for k, _ in items):
@@ -404,7 +429,7 @@ def cmd_run(args):
     root = os.path.abspath(args.dir)
     try:
         suite = load_suite(root)
-        tests = list_items(root, suite["tests"])
+        tests = everything = list_items(root, suite["tests"])
     except SuiteError as e:
         print(e)
         return 2
@@ -416,6 +441,10 @@ def cmd_run(args):
     if not tests:
         print("no tests selected")
         return 2
+    picked = tests
+    tests = add_needs(everything, picked, suite.get("needs", {}))
+    if len(tests) > len(picked):
+        print("added because they are needed first: " + ", ".join(t["name"] for t in tests if t not in picked))
     from keytap.recorder.recording import check_actions_file
     bad = [(t, p) for t in tests for p in [check_actions_file(os.path.join(t["path"], "actions.json"))] if p]
     if bad:

@@ -67,6 +67,15 @@ class Action:
     soft: Optional[bool] = None
     # element_tap only: skip the step when the element does not show up within timeout_ms
     optional: Optional[bool] = None
+    # any step, hand-edited: run it (and the when_span steps it covers) only if this selector shows up
+    # within when_timeout_ms (default 8s), else skip. On a run step, expand.py sets when_span to the
+    # length of the expanded flow.
+    when: Optional[dict] = None
+    when_timeout_ms: Optional[int] = None
+    when_span: Optional[int] = None
+    # element_tap only: selector of what the tap should bring up; if it is not on screen 3s after the
+    # tap, tap again (up to 2 more times). Better than retap_if_unchanged on screens that animate.
+    expect: Optional[dict] = None
     # element_tap only: if the screen did not change after the tap, tap again (a tap during a screen
     # transition is dropped by Android). Only for taps that always change the screen.
     retap_if_unchanged: Optional[bool] = None
@@ -222,6 +231,8 @@ class Recording:
                 direction=a.get("direction"),
                 check=a.get("check"), value=a.get("value"), soft=a.get("soft"),
                 optional=a.get("optional"),
+                when=a.get("when"), when_timeout_ms=a.get("when_timeout_ms"), when_span=a.get("when_span"),
+                expect=a.get("expect"),
                 retap_if_unchanged=a.get("retap_if_unchanged"),
                 flow=a.get("flow"), params=a.get("params"),
                 secret=a.get("secret"), origin=a.get("origin"),
@@ -411,7 +422,13 @@ def check_actions_file(path: str) -> List[str]:
                 problems.append(f"{where}: selector needs resource_id, content_desc or text{hint}")
         elif typ in ("element_tap", "scroll_to", "assert") and a.get("selector") is not None:
             problems.append(f'{where}: "selector" must be an object')
-        for opt in ("timeout_ms", "retries"):
+        for key in ("when", "expect"):
+            if key in a:
+                w = a[key]
+                if not isinstance(w, dict) or set(w) - _SELECTOR_KEYS or not (
+                        w.get("resource_id") or w.get("content_desc") or w.get("text")):
+                    problems.append(f'{where}: "{key}" must be a selector object with resource_id, content_desc or text')
+        for opt in ("timeout_ms", "retries", "when_timeout_ms"):
             if opt in a and not _is_count(a[opt]):
                 problems.append(f'{where}: "{opt}" must be a whole number, 0 or more')
         if a.get("direction") not in (None, "up", "down"):

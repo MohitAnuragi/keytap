@@ -102,6 +102,25 @@ keytap --backend screenrecord   # fallback capture
 
 ---
 
+## Which thing do I use?
+
+| Thing | What it is | Use when |
+|---|---|---|
+| `keytap.py` (`keytap`) | Interactive keyboard control of the phone, plus the recorder | Recording a new flow, or poking at the phone by hand |
+| Recording | One saved sequence of steps (taps, text, asserts) in an `actions.json` | It is the raw material: record it, then edit the JSON |
+| `replay.py` | Runs one recording headless, no window | A quick one-off: play this flow now (login aliases use it) |
+| Flow (`suites/<x>/flows/`) | A recording meant to be reused, e.g. login or dismiss popups. Tests call it with a `run` step | The same steps are needed in many tests |
+| Test (`suites/<x>/tests/`) | A recording with assertions; it passes or fails | You want a check that something works |
+| Suite (`suite.py`, `suite.json`) | A folder of tests and flows plus defaults (retries, login policy, restart between tests) | Running several tests together and getting a pass/fail report |
+| Run (`data/runs/...`) | Output folder of one execution: `result.json`, plus screenshot, hierarchy and logcat on failure | Debugging why something failed |
+| `nightly.py` | Unattended overnight loop over the suites in `nightly.json`, with phone and battery checks and a morning report | Running everything while you sleep |
+
+In short: build with the recorder, try a flow with `replay.py`, run a feature's tests with `suite.py run`, run everything unattended with `nightly.py`.
+
+Turn the phone's animations off before replaying. With them on, steps that wait for a screen transition fail with `element_not_found`.
+
+---
+
 ## Keybindings
 
 | Key | Action |
