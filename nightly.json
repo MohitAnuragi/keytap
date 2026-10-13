@@ -1,6 +1,13 @@
 {
-  "suites": ["suites/gopay_smoke"],
+  "suites": [
+    "suites/gopay_smoke",
+    "suites/gohost_group_invitations"
+  ],
   "max_hours": 7,
   "min_battery": 20,
-  "model": "gemma4:12b"
+  "model": "gemma4:12b",
+  "allow_steps": [
+    "clear_data",
+    "permission"
+  ]
 }
