@@ -17,7 +17,7 @@ INFRA_CAUSES = ("device_unavailable", "load_error")   # the phone or the recordi
 @dataclass
 class Options:
     serial: str = None
-    mode: str = "timed"
+    mode: str = "fast"
     wait: float = 10.0      # extra seconds to keep looking for an element after the recorded wait
     retries: int = 0
     quiet: bool = False

@@ -428,7 +428,7 @@ def cmd_run(args):
 
     d = suite["defaults"]
     pick = lambda cli, key, fallback: cli if cli is not None else d.get(key, fallback)
-    opts = engine.Options(serial=args.serial, mode=pick(args.mode, "mode", "timed"),
+    opts = engine.Options(serial=args.serial, mode=pick(args.mode, "mode", "fast"),
                           wait=pick(args.wait, "wait", 10.0), retries=pick(args.retries, "retries", 0),
                           quiet=True)   # the runner prints one line per test itself
     if not engine.pick_serial(opts):
@@ -534,7 +534,7 @@ def main():
     p.add_argument("--repeat", type=int, default=1, metavar="N", help="run each test N times (default: 1)")
     p.add_argument("--login", choices=["once", "always", "never"], help="force one login policy for every test")
     p.add_argument("--serial", metavar="ID", help="adb serial (default: the only attached phone)")
-    p.add_argument("--mode", choices=["fast", "timed"], help="default: timed, or suite.json defaults")
+    p.add_argument("--mode", choices=["fast", "timed"], help="default: fast, or suite.json defaults")
     p.add_argument("--wait", type=float, metavar="SECONDS", help="extra element wait (default: 10)")
     p.add_argument("--retries", type=int, metavar="N", help="extra attempts for a failed step (default: 0)")
     p.add_argument("--quiet", action="store_true", help="print only the final summary")

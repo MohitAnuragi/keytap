@@ -37,7 +37,7 @@ Top level: `{"name", "recorded_at", "serial", "device_resolution", "actions": [.
 
 ## Mode
 
-`./replay.py` defaults to `--mode timed`: the pauses of the recording are slept first (each capped at 10s). `--mode fast` uses 0.3s between steps.
+`./replay.py` and `./suite.py` default to `--mode fast`: 0.3s between steps, and a step that waits for an element or assertion polls for it, so a slow screen does not need a pause. `--mode timed` sleeps the pauses of the recording first (each capped at 10s), which is slower but matches the speed it was recorded at. A suite can set `"mode"` under `defaults` in `suite.json`. Fast mode can expose races on taps that fire during a screen transition: use selectors that exist only on their own screen, and `retap_if_unchanged` on taps that always change the screen.
 
 Validate any edit with `python3 -m keytap.recorder.recording --check <actions.json>` (from the keytap folder). `replay.py` also validates before it runs.
 
