@@ -80,6 +80,31 @@ class ActionReplayer:
     # ── Replay loop ───────────────────────────────────────────────────────────
 
     def _run(self, recording, serial, on_status, on_done, device_resolution):
+        try:
+            self._run_steps(recording, serial, on_status, on_done, device_resolution)
+        finally:
+            self._stop_dialog_watcher()
+
+    def _start_dialog_watcher(self):
+        """Tap Wait on Android's "isn't responding" dialog whenever it shows, at any step. It hides the
+        app's whole window, so no later step could find its element."""
+        try:
+            w = self._u2_dev.watcher
+            w("anr_wait").when('//*[@resource-id="android:id/aerr_wait"]').click()
+            w.start()
+        except Exception as e:
+            if self._on_status:
+                self._on_status(f"[WARN] dialog watcher not started: {type(e).__name__}: {e}")
+
+    def _stop_dialog_watcher(self):
+        try:
+            if self._u2_dev is not None:
+                self._u2_dev.watcher.stop()
+                self._u2_dev.watcher.remove()
+        except Exception:
+            pass
+
+    def _run_steps(self, recording, serial, on_status, on_done, device_resolution):
         self._on_status = on_status
         self._serial = serial
         actions.set_sync(True)   # each step finishes before the next starts
@@ -97,6 +122,7 @@ class ActionReplayer:
             try:
                 import uiautomator2 as u2
                 self._u2_dev = u2.connect(serial) if serial else u2.connect()
+                self._start_dialog_watcher()
             except Exception as e:
                 self._u2_dev = None
                 self._u2_error = f"{type(e).__name__}: {e}"
@@ -279,6 +305,12 @@ class ActionReplayer:
                 cx, cy = el.center()
                 actions.tap(cx, cy)
                 return True, None
+
+        # a screen that only sometimes appears (promo, country prompt): skip, never fail or guess
+        if action.optional and dev is not None and not last_exc:
+            if self._on_status:
+                self._on_status(f"[SKIP] optional '{self._describe(sel)}' not on screen after {timeout_s:g}s")
+            return True, None
 
         # not found (or no u2): coordinates only for taps recorded without any identifier
         if not action.reliable and action.fallback_coords:

@@ -65,6 +65,8 @@ class Action:
     check: Optional[str] = None
     value: Optional[str] = None
     soft: Optional[bool] = None
+    # element_tap only: skip the step when the element does not show up within timeout_ms
+    optional: Optional[bool] = None
     # run step (expanded before replay, see expand.py): flow folder and its params
     flow: Optional[str] = None
     params: Optional[dict] = None
@@ -216,6 +218,7 @@ class Recording:
                 retries=a.get("retries"),
                 direction=a.get("direction"),
                 check=a.get("check"), value=a.get("value"), soft=a.get("soft"),
+                optional=a.get("optional"),
                 flow=a.get("flow"), params=a.get("params"),
                 secret=a.get("secret"), origin=a.get("origin"),
             ))
