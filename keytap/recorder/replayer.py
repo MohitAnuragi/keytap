@@ -303,7 +303,10 @@ class ActionReplayer:
             el, last_exc = self._wait_for_element(dev, sel, timeout_s, recorded_s)
             if el is not None:
                 cx, cy = el.center()
-                actions.tap(cx, cy)
+                if action.retap_if_unchanged:
+                    self._tap_until_screen_changes(dev, cx, cy)
+                else:
+                    actions.tap(cx, cy)
                 return True, None
 
         # a screen that only sometimes appears (promo, country prompt): skip, never fail or guess
@@ -326,6 +329,40 @@ class ActionReplayer:
         if last_exc:
             return False, f"element lookup failed: {last_exc}"
         return False, f"element '{self._describe(sel)}' not found after {self._waited(recorded_s, timeout_s)}"
+
+    MAX_RETAPS = 2        # extra taps when the screen did not change
+    RETAP_WAIT_S = 1.5    # how long to watch for a change after each tap
+
+    @staticmethod
+    def _screen_signature(dev):
+        """What is on screen, without the system status bar (clock and network speed change on their own).
+        None when the hierarchy cannot be read."""
+        try:
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(dev.dump_hierarchy())
+            return frozenset((n.get("package"), n.get("resource-id"), n.get("text"),
+                              n.get("content-desc"), n.get("bounds"))
+                             for n in root.iter("node") if n.get("package") != "com.android.systemui")
+        except Exception:
+            return None
+
+    def _tap_until_screen_changes(self, dev, cx, cy):
+        """Tap, and if the screen is the same a moment later tap again, up to MAX_RETAPS times. Android drops
+        a tap that lands while the previous screen is still animating. Gives up quietly: the next step's
+        own wait reports the failure."""
+        before = self._screen_signature(dev)
+        for attempt in range(1 + self.MAX_RETAPS):
+            actions.tap(cx, cy)
+            if before is None:
+                return
+            deadline = time.time() + self.RETAP_WAIT_S
+            while time.time() < deadline:
+                time.sleep(0.3)
+                after = self._screen_signature(dev)
+                if after is None or after != before:
+                    return
+            if self._on_status and attempt < self.MAX_RETAPS:
+                self._on_status(f"[RETAP {attempt + 1}/{self.MAX_RETAPS}] screen unchanged after tap, tapping again")
 
     def _execute_scroll_to(self, action: Action):
         """Swipe until the element is on screen. Does not tap it."""

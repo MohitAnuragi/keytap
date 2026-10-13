@@ -67,6 +67,9 @@ class Action:
     soft: Optional[bool] = None
     # element_tap only: skip the step when the element does not show up within timeout_ms
     optional: Optional[bool] = None
+    # element_tap only: if the screen did not change after the tap, tap again (a tap during a screen
+    # transition is dropped by Android). Only for taps that always change the screen.
+    retap_if_unchanged: Optional[bool] = None
     # run step (expanded before replay, see expand.py): flow folder and its params
     flow: Optional[str] = None
     params: Optional[dict] = None
@@ -219,6 +222,7 @@ class Recording:
                 direction=a.get("direction"),
                 check=a.get("check"), value=a.get("value"), soft=a.get("soft"),
                 optional=a.get("optional"),
+                retap_if_unchanged=a.get("retap_if_unchanged"),
                 flow=a.get("flow"), params=a.get("params"),
                 secret=a.get("secret"), origin=a.get("origin"),
             ))

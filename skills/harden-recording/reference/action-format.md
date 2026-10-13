@@ -4,7 +4,7 @@ Top level: `{"name", "recorded_at", "serial", "device_resolution", "actions": [.
 
 | type | fields |
 |---|---|
-| `element_tap` | `selector`, `fallback_coords`, `reliable`, `timeout_ms`, `retries`, `optional` (skip the step if the element is not on screen within `timeout_ms`; set a short `timeout_ms`, for example 4000) |
+| `element_tap` | `selector`, `fallback_coords`, `reliable`, `timeout_ms`, `retries`, `optional` (skip the step if the element is not on screen within `timeout_ms`; set a short `timeout_ms`, for example 4000), `retap_if_unchanged` (if the screen is the same 1.5 s after the tap, tap again, up to 2 more times; only for taps that always change the screen, never for ones that create or send something) |
 | `scroll_to` | `selector`, `direction` (`down` default, or `up`), `retries`. Swipes up to 8 times until the element is on screen. Does not tap |
 | `tap` | `x`, `y` (screen pixels) |
 | `swipe` | `x1`, `y1`, `x2`, `y2`, `duration` |
