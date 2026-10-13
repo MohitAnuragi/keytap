@@ -71,6 +71,7 @@ class Action:
     # within when_timeout_ms (default 8s), else skip. On a run step, expand.py sets when_span to the
     # length of the expanded flow.
     when: Optional[dict] = None
+    unless: Optional[dict] = None     # the opposite: run only if this selector is NOT on screen after ~2s
     when_timeout_ms: Optional[int] = None
     when_span: Optional[int] = None
     # input_text only: after typing, read the focused field and set the text directly if characters were
@@ -234,7 +235,7 @@ class Recording:
                 direction=a.get("direction"),
                 check=a.get("check"), value=a.get("value"), soft=a.get("soft"),
                 optional=a.get("optional"),
-                when=a.get("when"), when_timeout_ms=a.get("when_timeout_ms"), when_span=a.get("when_span"),
+                when=a.get("when"), unless=a.get("unless"), when_timeout_ms=a.get("when_timeout_ms"), when_span=a.get("when_span"),
                 expect=a.get("expect"), verify=a.get("verify"),
                 retap_if_unchanged=a.get("retap_if_unchanged"),
                 flow=a.get("flow"), params=a.get("params"),
@@ -425,7 +426,7 @@ def check_actions_file(path: str) -> List[str]:
                 problems.append(f"{where}: selector needs resource_id, content_desc or text{hint}")
         elif typ in ("element_tap", "scroll_to", "assert") and a.get("selector") is not None:
             problems.append(f'{where}: "selector" must be an object')
-        for key in ("when", "expect"):
+        for key in ("when", "unless", "expect"):
             if key in a:
                 w = a[key]
                 if not isinstance(w, dict) or set(w) - _SELECTOR_KEYS or not (

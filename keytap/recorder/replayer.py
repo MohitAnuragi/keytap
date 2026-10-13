@@ -121,7 +121,7 @@ class ActionReplayer:
 
         # Pre-connect u2 once for the whole replay if any step looks up elements
         self._u2_error = ""
-        if any(a.type in ("element_tap", "scroll_to", "assert") or a.when or a.verify for a in recording.actions):
+        if any(a.type in ("element_tap", "scroll_to", "assert") or a.when or a.unless or a.verify for a in recording.actions):
             try:
                 import uiautomator2 as u2
                 self._u2_dev = u2.connect(serial) if serial else u2.connect()
@@ -195,25 +195,26 @@ class ActionReplayer:
         on_done(success=True, step=total, error=None)
 
     def _verify_typed(self, text: str):
-        """adb "input text" can drop characters. Read the focused field and, if it differs, set the text
-        directly (up to 2 times). A field that cannot be read is not a failure: nothing to compare."""
-        found = None
+        """adb "input text" can drop characters. Check that the typed text is on screen; if not, empty the
+        field and type it one character at a time (up to 2 times). Never fails on a UI lookup error."""
         try:
             for attempt in range(3):
                 time.sleep(0.5)
-                field = self._u2_dev(focused=True)
-                found = field.get_text() if field.exists else None
-                if found == text:
+                if self._u2_dev(text=text).exists:
                     return True, None
-                if attempt < 2 and field.exists:
-                    if self._on_status:
-                        self._on_status(f"[RETYPE {attempt + 1}/2] field has {found!r}, setting {text!r}")
-                    field.set_text(text)
+                if attempt == 2:
+                    break
+                if self._on_status:
+                    self._on_status(f"[RETYPE {attempt + 1}/2] '{text}' is not in the field, typing it slowly")
+                actions.adb("shell", "input", "keyevent", "123", *["67"] * 60)   # move to end, delete back
+                for ch in text:
+                    actions.input_text(ch)
+                    time.sleep(0.15)
         except Exception as e:
             if self._on_status:
                 self._on_status(f"[WARN] could not check the typed text: {type(e).__name__}")
             return True, None
-        return False, f"typed text did not reach the field: wanted {text!r}, found {found!r}"
+        return False, f"typed text did not reach the field: wanted {text!r}"
 
     def _when_skips(self, action: Action):
         """(why the step is skipped or None, ok, error). A step with "when" runs only if that element
@@ -221,10 +222,20 @@ class ActionReplayer:
         if self._skip_left > 0:
             self._skip_left -= 1
             return "inside a block whose when did not hold", True, None
-        if not action.when:
+        if not (action.when or action.unless):
             return None, True, None
         if self._u2_dev is None:
             return None, False, self._unavailable()
+        if action.unless:
+            sel = ElementSelector(**action.unless)
+            el, _ = self._wait_for_element(self._u2_dev, sel, 2.0)
+            if el is None:
+                return None, True, None
+            self._skip_left = (action.when_span or 1) - 1
+            why = f"unless '{self._describe(sel)}' is on screen"
+            if self._on_status:
+                self._on_status(f"[SKIP] {why}")
+            return why, True, None
         sel = ElementSelector(**action.when)
         timeout_s = (action.when_timeout_ms or self.WHEN_TIMEOUT_MS) / 1000
         el, _ = self._wait_for_element(self._u2_dev, sel, timeout_s)

@@ -10,6 +10,7 @@ Placeholders in any string of an action:
   {{env:NAME}}   an environment variable, so credentials never live in files. An input_text that
                  used one is marked secret and shown as *** in logs.
 
+"unless": {selector} is the opposite: the step (or flow) runs only if that element is NOT on screen.
 "when": {selector} on any step (or run step) runs it only if that element shows up within
 "when_timeout_ms" (default 8000), else skips it. On a run step it guards the whole flow, decided once
 when the flow starts, so the flow's own taps may make the element vanish.
@@ -121,7 +122,7 @@ def _expand(path, root, params, vars_, resolve_env, strict, stack):
             if stack:
                 a["origin"] = f"{name} step {k}"
             a["t"] = a.get("t", 0) + shift
-            if a.get("when"):
+            if a.get("when") or a.get("unless"):
                 a.setdefault("when_span", 1)
             out.append(a)
             continue
@@ -133,10 +134,11 @@ def _expand(path, root, params, vars_, resolve_env, strict, stack):
             raise LoadError(f"flows nested deeper than {MAX_DEPTH}: {' -> '.join(os.path.basename(p) for p in stack)}")
         _, inner = _expand(flow, root, {**params, **(a.get("params") or {})}, vars_,
                            resolve_env, strict, stack + (os.path.normpath(path),))
-        if a.get("when") and inner:
-            if inner[0].get("when"):
-                raise LoadError(f'run step "{a["flow"]}": has "when", and its first step has one too')
-            inner[0].update(when=a["when"], when_span=len(inner), when_timeout_ms=a.get("when_timeout_ms"))
+        cond = next((k for k in ("when", "unless") if a.get(k)), None)
+        if cond and inner:
+            if inner[0].get("when") or inner[0].get("unless"):
+                raise LoadError(f'run step "{a["flow"]}": has "{cond}", and its first step has a condition too')
+            inner[0].update({cond: a[cond], "when_span": len(inner), "when_timeout_ms": a.get("when_timeout_ms")})
         start = a.get("t", 0) + shift
         for ia in inner:
             ia["t"] += start
