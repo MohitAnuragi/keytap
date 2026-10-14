@@ -110,7 +110,7 @@ def reset_state(rec, package, how):
 
 def run_once(rec, opts, run_dir, package, health, say):
     from keytap.device.adb import adb, get_device_size
-    from keytap.runner.failure_bundle import _crash, capture
+    from keytap.runner.failure_bundle import ANR, _crash, capture
     from keytap.recorder.replayer import ActionReplayer
 
     os.makedirs(run_dir, exist_ok=True)
@@ -142,19 +142,22 @@ def run_once(rec, opts, run_dir, package, health, say):
     label = rep.results[-1]["label"] if rep.results else ""
     if rep.results and rep.results[-1].get("origin"):
         label += f"  [{rep.results[-1]['origin']}]"
-    if success:   # implicit assertion: the app must not have crashed or hung during the run
+    anr = False
+    if success:   # implicit assertion: the app must not have crashed during the run (an ANR only warns)
         try:
             logcat = adb("logcat", "-d", "-t", "2000", "-v", "threadtime").stdout.decode(errors="replace")
         except Exception:
             logcat = ""
         crash = _crash(logcat, package)
-        if crash:
+        if crash == ANR:   # a hang the steps got through: the run's own steps decide, the ANR is reported
+            anr = True
+        elif crash:
             success, step, label = False, len(rec.actions), "(after the last step)"
             error = f"the app crashed during the run: {crash}"
 
     result = {"recording": rec.name, "serial": opts.serial or "",
               "success": success, "total_steps": len(rec.actions),
-              "battery": health["battery"], "warnings": sum(r["status"] == "warn" for r in rep.results),
+              "battery": health["battery"], "warnings": sum(r["status"] == "warn" for r in rep.results) + anr, "anr": anr,
               "duration_s": round(time.time() - started, 1), "steps": rep.results}
     if not success:
         result["failure"] = capture(os.path.join(run_dir, "failure"), step, label, error,

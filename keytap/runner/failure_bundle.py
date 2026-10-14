@@ -68,10 +68,13 @@ def _screen(xml: str) -> dict:
     return {"ids": ids[:20], "texts": texts[:12], "clickable": clickable[:MAX_CLICKABLE]}
 
 
+ANR = "ANR in the app"
+
+
 def _crash(logcat: str, package: str) -> str:
     pkg = re.escape(package) if package else r"[\w.]+"
     if re.search(rf"ANR in {pkg}", logcat):
-        return "ANR in the app"
+        return ANR
     if re.search(rf"FATAL EXCEPTION[\s\S]{{0,400}}?Process: {pkg}", logcat):
         return "the app crashed (FATAL EXCEPTION in logcat.txt)"
     return ""
