@@ -176,8 +176,9 @@ class ActionReplayer:
                        and not error.startswith("uiautomator2 unavailable")):
                     attempt += 1
                     on_status(f"[RETRY {attempt}/{retries}] step {i + 1}: {error}")
-                    swept += self._clear_blockers()   # a dialog may be what made the step fail
-                    if not swept and self.llm_model:
+                    closed = self._clear_blockers()   # a dialog may be what made the step fail
+                    swept += closed
+                    if not closed and self.llm_model:   # this retry's sweep found nothing, so ask the model
                         helped += self._steer(action, error)   # an unlisted dialog or the wrong screen: ask the model
                     time.sleep(self.RETRY_PAUSE_S)
                     ok, error = self._execute_safe(action, serial)
