@@ -56,6 +56,12 @@ def save_state(state):
 
 
 def hierarchy():
+    try:   # uiautomator2 dumps in about 0.4 s, plain `uiautomator dump` takes about 2.5 s
+        import uiautomator2 as u2
+        xml = u2.connect().dump_hierarchy()
+        return xml if isinstance(xml, str) else xml.decode(errors="replace")
+    except Exception:
+        pass
     out = adb("exec-out", "uiautomator", "dump", "/dev/tty")
     end = out.find("</hierarchy>")
     if end < 0:
@@ -129,8 +135,9 @@ def snapshot(state, quiet_if_same):
     taps = [i for i in items[:MAX_LINES] if i[0]]
     text = render(items, foreground())
     sig = hashlib.md5(text.encode()).hexdigest()
-    same = quiet_if_same and state.get("sig") == sig
-    state.update(sig=sig, taps=[{"label": l, "xy": xy} for _, l, xy in taps])
+    # a signature from an old session means the caller has not seen that screen, so print it
+    same = quiet_if_same and state.get("sig") == sig and time.time() - state.get("sig_at", 0) < 300
+    state.update(sig=sig, sig_at=time.time(), taps=[{"label": l, "xy": xy} for _, l, xy in taps])
     save_state(state)
     return "screen unchanged" if same else text
 
@@ -191,7 +198,15 @@ def cmd_swipe(a, state):
 
 
 def cmd_launch(a, state):
-    adb("shell", "monkey", "-p", a.package, "-c", "android.intent.category.LAUNCHER", "1")
+    # debug tools such as LeakCanary add a second launcher entry to the package, so monkey would pick one at random
+    out = adb("shell", "cmd", "package", "query-activities", "--brief", "-a", "android.intent.action.MAIN",
+              "-c", "android.intent.category.LAUNCHER", a.package)
+    found = re.findall(rf"^\s*({re.escape(a.package)}/\S+)\s*$", out, re.M)
+    comp = next((c for c in found if "leakcanary" not in c.lower()), found[0] if found else None)
+    if comp:
+        adb("shell", "am", "start", "-a", "android.intent.action.MAIN", "-c", "android.intent.category.LAUNCHER", "-n", comp)
+    else:
+        adb("shell", "monkey", "-p", a.package, "-c", "android.intent.category.LAUNCHER", "1")
     settle(a.wait + 1)
     print(snapshot(state, True))
 
