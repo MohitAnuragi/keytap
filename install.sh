@@ -2,7 +2,7 @@
 # keytap install script
 # Installs Python dependencies, checks system tools, registers the
 # `keytap` shell command in your ~/.zshrc or ~/.bash_profile, and installs the
-# Claude skills (harden-recording, harden-suite) into ~/.claude/skills so it works from any folder.
+# Claude skills (harden-recording, harden-suite, steer-phone) into ~/.claude/skills so it works from any folder.
 #
 # Usage:
 #   bash install.sh               # full install

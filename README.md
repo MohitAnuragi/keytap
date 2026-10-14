@@ -115,10 +115,27 @@ keytap --backend screenrecord   # fallback capture
 | Run (`data/runs/...`) | Output folder of one execution: `result.json`, plus screenshot, hierarchy and logcat on failure | Debugging why something failed |
 | `dashboard.py` | Local web page (http://127.0.0.1:8765) that follows runs live: what is running, every test and step, retries, failures, plus a "how a run works" page. Its Run panel can start and stop a suite run or a nightly (one at a time, through `run_suite.sh` and `run_nightly.sh`, behind a confirm dialog) | You want to see what a nightly or suite run is doing, or why it failed |
 | `nightly.py` | Unattended overnight loop over the suites in `nightly.json`, with phone and battery checks and a morning report | Running everything while you sleep |
+| `steer.py` | Small commands for an AI to drive the phone one step at a time, with a short numbered screen instead of the raw hierarchy (see below) | A one-off check you want an AI to do (run a flow, verify a screen) without building a test suite |
 
 In short: build with the recorder, try a flow with `replay.py`, run a feature's tests with `suite.py run`, run everything unattended with `nightly.py`.
 
 Turn the phone's animations off before replaying. With them on, steps that wait for a screen transition fail with `element_not_found`.
+
+### Letting an AI steer the phone (`steer.py`)
+
+For a one-time check (run a flow, see what a screen shows) a test suite is overkill. `steer.py` gives an AI small commands to drive the phone. A raw uiautomator dump is about 90 KB (roughly 25k tokens) per step; `steer.py screen` prints only the visible text and the tappable elements, numbered, about 120-250 tokens. On one invite workflow (11 observed steps) the screens cost about 1k tokens against about 190k for raw dumps (token counts are estimates, characters divided by 3.5).
+
+```
+./steer.py screen                          what is on screen, tappable items numbered
+./steer.py tap 5 | tap "Accept" [nth]      tap by number or by label, then print the new screen
+./steer.py type "text" | key back | swipe up | launch <package>
+./steer.py do "tap Chat" "tap Groups"      several steps in one call (labels only, money words refused)
+./steer.py flow <dir> --package <pkg>      replay a keytap flow in one call; a flow that wipes app data (clear_data) needs --allow-clear
+./steer.py see "is a dialog open?"         local vision model answers; the picture never reaches the AI
+./steer.py mark ; ./steer.py logs "regex"  count and a few logcat lines since the mark
+```
+
+Add `--quiet` to any action to print one line instead of the screen. The `steer-phone` Claude skill (in `skills/`) teaches an AI to use this instead of raw dumps. `see` can be wrong about state such as the selected tab; trust the screen text first.
 
 ### Step options (in `actions.json`)
 
@@ -161,10 +178,10 @@ Placeholders in any string of an action: `{{param}}` from a `run` step, `{{ts}}`
 ## Code layout
 
 ```
-keytap.py  replay.py  suite.py  nightly.py  dashboard.py     commands, thin wrappers (run them from the keytap folder)
+keytap.py  replay.py  suite.py  nightly.py  dashboard.py  steer.py     commands, thin wrappers (run them from the keytap folder)
 install.sh  bootstrap.sh           install and one-liner setup
 docs/                              roadmaps and design notes
-skills/                            the harden-recording and harden-suite Claude skills (install.sh copies it to ~/.claude)
+skills/                            the harden-recording, harden-suite and steer-phone Claude skills (install.sh copies it to ~/.claude)
 data/  suites/                     your recordings, traces, heap dumps and test suites (gitignored)
 keytap/                            the Python package
   core/       config, paths, settings, utils, fonts
