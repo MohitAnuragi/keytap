@@ -28,7 +28,7 @@ KEYTAP = the folder that contains `steer.py`: the current folder if `./steer.py`
 
 Every command that prints the screen takes two filters. `--find "regex"` prints only the lines whose label matches (case-insensitive), with the screen's own numbers, so `--find "accept|decline"` costs a few tokens on a busy screen and `tap` still works with those numbers. `--top` prints only the topmost menu or sheet drawn over the screen, renumbered from 1; the header says `[top layer]` for a menu or sheet inside the app window and `[dialog window]` for a system dialog in its own window (an ANR box), and `[no overlay found: whole screen]` when there is neither. When an ANR dialog is up the app window is missing from the dump, so a plain `screen` already shows only the dialog. Prefer `--find` when you know what you are looking for.
 
-Every action prints the new screen, or `screen unchanged`. Add `--quiet` to any action and it prints one line (`ok`) instead; use it for a step whose result you do not need to read. After a quiet action the numbers are stale: tap by label, or run `screen` first. Numbers are only valid for the latest printed screen: after a screen change, read the new numbers, do not reuse old ones.
+Every action prints the new screen, or `screen unchanged`. Add `--quiet` to any action and it prints one line (`ok`) instead; use it for a step whose result you do not need to read. After a quiet action the numbers are stale: tap by label, or run `screen` first. A switch or checkbox shows as `[on] Title` or `[off] Title`, so `tap "Auto-join"` toggles it and a `--find` afterwards shows the new state. Numbers are only valid for the latest printed screen: after a screen change, read the new numbers, do not reuse old ones.
 
 ## Batching and flows
 
