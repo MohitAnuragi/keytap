@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How a Test Run Works</title>
+<style>
+:root {
+  --bg: #f4f5f7; --card: #ffffff; --ink: #1c2330; --muted: #667085; --line: #e3e6ec;
+  --pass: #1a7f4b; --pass-bg: #e3f4ea; --fail: #c0362c; --fail-bg: #fbe7e5;
+  --warn: #a15c00; --warn-bg: #fdf0d8; --run: #1f5fbf; --run-bg: #e3edfb; --idle-bg: #eceef2; --accent: #1f5fbf;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #12151b; --card: #1b2029; --ink: #e8ebf1; --muted: #98a2b3; --line: #2b323f;
+    --pass: #5fd08f; --pass-bg: #163325; --fail: #ff8a80; --fail-bg: #3a1c1a;
+    --warn: #f2b45a; --warn-bg: #3a2a10; --run: #7db1ff; --run-bg: #172a47; --idle-bg: #262c38; --accent: #7db1ff;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.55 -apple-system, "Segoe UI", Roboto, sans-serif; }
+a { color: var(--accent); }
+.wrap { max-width: 920px; margin: 0 auto; padding: 0 16px 70px; }
+header { padding: 18px 0 4px; }
+h1 { font-size: 22px; margin: 0 0 6px; }
+nav a { margin-right: 16px; font-weight: 600; text-decoration: none; }
+nav a.cur { border-bottom: 2px solid var(--accent); }
+h2 { font-size: 18px; margin: 0 0 6px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px; margin: 16px 0; }
+.lead { color: var(--muted); margin: 0 0 12px; }
+.box { border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; background: var(--bg); }
+.box b { display: block; }
+.box small { color: var(--muted); display: block; }
+.box.run { background: var(--run-bg); border-color: transparent; }
+.box.good { background: var(--pass-bg); border-color: transparent; }
+.box.bad { background: var(--fail-bg); border-color: transparent; }
+.box.warn { background: var(--warn-bg); border-color: transparent; }
+.down { width: 2px; height: 18px; background: var(--line); margin: 0 auto; position: relative; }
+.down::after { content: ""; position: absolute; left: -4px; bottom: -2px; border: 5px solid transparent; border-top: 7px solid var(--line); border-bottom: 0; }
+.row { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
+.stack { max-width: 520px; margin: 0 auto; }
+table { width: 100%; border-collapse: collapse; margin-top: 6px; }
+th { text-align: left; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; padding: 6px 8px; }
+td { padding: 8px; border-top: 1px solid var(--line); vertical-align: top; }
+code { background: var(--idle-bg); padding: 1px 6px; border-radius: 5px; font: 13px ui-monospace, Menlo, monospace; overflow-wrap: anywhere; }
+td:first-child code { white-space: nowrap; }
+td:nth-child(2) code { white-space: nowrap; }
+.n { display: inline-block; width: 22px; height: 22px; line-height: 22px; text-align: center; border-radius: 50%; background: var(--accent); color: var(--card); font-size: 13px; font-weight: 700; margin-right: 6px; }
+.note { border-left: 3px solid var(--warn); padding: 4px 12px; margin: 12px 0 0; color: var(--ink); background: var(--warn-bg); border-radius: 0 8px 8px 0; }
+ul { margin: 6px 0; padding-left: 20px; }
+.tag { display: inline-block; padding: 0 8px; border-radius: 6px; font-size: 12px; font-weight: 700; background: var(--idle-bg); }
+@media (max-width: 720px) { td, th { padding: 6px 4px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>How a test run works</h1>
+  <nav><a href="/">Dashboard</a><a href="/flow" class="cur">How a run works</a></nav>
+</header>
+
+<div class="card">
+  <h2>1. The big picture: five layers, each one calls the next</h2>
+  <p class="lead">Read it top to bottom. Each box starts the box below it and waits for its answer.</p>
+  <div class="stack">
+    <div class="box"><b>You (or a schedule)</b><small><code>nightly.py</code> for an unattended night, <code>suite.py run</code> for one suite, <code>replay.py</code> for one recording.</small></div>
+    <div class="down"></div>
+    <div class="box run"><b>Supervisor (nightly only)</b><small>Goes through the suites and their tests in the order of <code>suite.json</code>. Checks the phone and battery, retries failures, asks the local model for help, writes the morning report.</small></div>
+    <div class="down"></div>
+    <div class="box run"><b>suite.py run</b><small>Runs one test. Adds the setup tests it needs first, restarts the app before each test, logs in if the test asks for it.</small></div>
+    <div class="down"></div>
+    <div class="box run"><b>Engine and replayer</b><small>Plays the test's steps on the phone one by one: tap, type, check. Retries a failing step, and fails the test if it keeps failing.</small></div>
+    <div class="down"></div>
+    <div class="box good"><b>Result files</b><small>Everything is written to disk. This dashboard only reads those files, it never touches the phone.</small></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>2. The life of one test in a nightly</h2>
+  <p class="lead">This is what the supervisor does for every test, one at a time. It tries a failing test up to 3 times.</p>
+  <div class="stack">
+    <div class="box"><span class="n">1</span><b style="display:inline">Pre-check</b><small>Does the test use something unsafe overnight (wipe data, grant permissions)? Only if the config allows it. Is the phone online and the battery above the limit?</small></div>
+    <div class="down"></div>
+    <div class="box"><span class="n">2</span><b style="display:inline">Setup needed?</b><small>Some tests need data another test creates (for example an invitation). That setup test runs first, unless the supervisor knows the data from earlier tonight is still fresh. Then it is skipped, and the dashboard shows "reused".</small></div>
+    <div class="down"></div>
+    <div class="box run"><span class="n">3</span><b style="display:inline">Run the attempt</b><small>suite.py plays the test. The dashboard shows the step it is on, live.</small></div>
+    <div class="down"></div>
+    <div class="row">
+      <div class="box good"><b>It passed</b><small>Go to the next test. If it only passed after a retry, it is marked "passed after a retry".</small></div>
+      <div class="box bad"><b>It failed</b><small>The supervisor reads why: a check failed, a button was missing, the app crashed, the phone vanished.</small></div>
+    </div>
+    <div class="down"></div>
+    <div class="box warn"><span class="n">4</span><b style="display:inline">Recover, then try again</b>
+      <small>Phone problem: wait 30 seconds. Screen problem: the local model looks at the screen and closes error dialogs. Anything else: restart the app. Then the test starts again from its first step. If it fails the same way twice, the supervisor stops trying.</small></div>
+    <div class="down"></div>
+    <div class="box"><span class="n">5</span><b style="display:inline">After the last failed attempt</b><small>The local model writes a short diagnosis of what it saw (for example "wrong screen"). It never changes a test by itself. Then the next test starts.</small></div>
+  </div>
+  <div class="note">An ANR (the app froze for a moment) used to fail a run even when every step passed. Now it only shows as a warning. A real crash still fails the run.</div>
+</div>
+
+<div class="card">
+  <h2>3. The life of one step</h2>
+  <p class="lead">A test is a list of steps. A step is one tap, one typed text or one check.</p>
+  <div class="stack">
+    <div class="box run"><b>Look for the element on the screen</b><small>Wait for it up to the time recorded for that step plus 10 seconds, or up to a fixed time if the step sets one. Shown as "waiting for the element".</small></div>
+    <div class="down"></div>
+    <div class="row">
+      <div class="box good"><b>Found</b><small>Do the action (tap, type, check). Some taps repeat themselves if the screen did not change.</small></div>
+      <div class="box warn"><b>Not found, and the step is optional</b><small>Skip it. For example a popup that only appears sometimes.</small></div>
+      <div class="box bad"><b>Not found, and it is required</b><small>Retry the step up to 2 more times. Shown as "step failed, retry 1 of 2". If it still fails, the test fails.</small></div>
+    </div>
+  </div>
+  <p style="margin-top:14px"><b>Step options</b> you will see mentioned in the results:</p>
+  <table>
+    <thead><tr><th>Option</th><th>What it does</th><th>Why it exists</th></tr></thead>
+    <tbody>
+      <tr><td><code>optional</code></td><td>Skip the step if its element never shows up</td><td>Popups that only appear sometimes</td></tr>
+      <tr><td><code>when</code></td><td>Run the step only if an element shows up in time</td><td>The OTP screen appears for some logins only</td></tr>
+      <tr><td><code>when_else</code></td><td>With <code>when</code>: also watch for the screen that means "skip". Whichever shows first decides</td><td>A skipped step costs about a second, not the full wait</td></tr>
+      <tr><td><code>unless</code></td><td>Run the step only if an element is not on screen</td><td>Recovery steps that only matter when something is missing</td></tr>
+      <tr><td><code>expect</code></td><td>Tap, then tap again until the next screen appears</td><td>Taps that get dropped while the screen is moving</td></tr>
+      <tr><td><code>verify</code></td><td>After typing, check the text arrived, retype if not</td><td>Typed text arrives short or empty on a busy phone</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h2>4. Retries happen at three levels</h2>
+  <p class="lead">When the dashboard says "retry", it helps to know which one.</p>
+  <table>
+    <thead><tr><th>Level</th><th>What is repeated</th><th>How many times</th><th>What it costs</th></tr></thead>
+    <tbody>
+      <tr><td><b>Step retry</b></td><td>Only the one failing step</td><td>2 extra tries</td><td>Seconds</td></tr>
+      <tr><td><b>Attempt</b></td><td>The whole test, from its first step, after a recovery</td><td>Up to 3 attempts in total</td><td>The whole test again (up to minutes)</td></tr>
+      <tr><td><b>Setup again</b></td><td>The setup test that creates data (it logs in, creates groups, logs in again)</td><td>On every later attempt of a test that needs it</td><td>About 4 to 5 minutes and 3 new groups</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h2>5. The group invitations suite, in order</h2>
+  <p class="lead">Two test accounts are involved: <b>Hardeep</b> creates groups and invites, <b>Siddharth</b> receives the invitations. The phone holds one logged-in account at a time, so switching means wiping the app data and logging in again (about 50 seconds).</p>
+  <table>
+    <thead><tr><th>#</th><th>Test</th><th>What it does</th><th>Needs first</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td><code>gi_login_as_hardeep</code></td><td>Logs in as Hardeep and checks Home shows</td><td></td></tr>
+      <tr><td>2</td><td><code>gi_login_as_siddharth</code></td><td>Same for Siddharth</td><td></td></tr>
+      <tr><td>3</td><td><code>gi_popups_dismissed_on_home</code></td><td>First-run popups are closed when present</td><td></td></tr>
+      <tr><td>4</td><td><code>gi_invite_hardeep_invites_siddharth</code></td><td><b>The setup test.</b> Hardeep creates 3 groups and invites Siddharth to each, then Siddharth logs in and the newest invitation is checked</td><td></td></tr>
+      <tr><td>5-8</td><td>Four card tests</td><td>Only look at Siddharth's invitations card: it shows, it is hidden on other tabs, it collapses and expands, View all lists everything</td><td>Test 4 (they reuse its data)</td></tr>
+      <tr><td>9</td><td><code>gi_decline_invitation_removes_it</code></td><td>Creates its own invitation, declines it, checks it disappears</td><td>Nothing (self-contained)</td></tr>
+      <tr><td>10</td><td><code>gi_accept_invitation_joins_group</code></td><td>Creates its own invitation, accepts it, checks Siddharth lands in the group</td><td>Nothing (self-contained)</td></tr>
+    </tbody>
+  </table>
+  <p style="margin-top:12px"><b>The setup test, step by step</b></p>
+  <div class="row">
+    <div class="box"><span class="n">1</span>Log in as Hardeep</div>
+    <div class="box"><span class="n">2</span>Create group a, invite Siddharth, restart the app</div>
+    <div class="box"><span class="n">3</span>Create group b, invite, restart the app</div>
+    <div class="box"><span class="n">4</span>Create group c, invite</div>
+    <div class="box"><span class="n">5</span>Log in as Siddharth</div>
+    <div class="box"><span class="n">6</span>Open the Groups tab, check the newest invitation is group c</div>
+  </div>
+  <div class="note">Invitations only appear if each account's "Auto-join groups" privacy setting is OFF (Profile, Privacy settings). With it ON, people are added to the group directly and no card is ever created.</div>
+  <div class="note">Every test run leaves real groups and pending invitations on the test accounts. They pile up, which can change what the card shows after a while. The dashboard's "Groups created" counter shows how many a run made.</div>
+</div>
+
+<div class="card">
+  <h2>6. Where the dashboard gets its facts</h2>
+  <table>
+    <thead><tr><th>File</th><th>What is in it</th></tr></thead>
+    <tbody>
+      <tr><td><code>data/nightly/&lt;night&gt;/audit.jsonl</code></td><td>The night's event log: attempts, recoveries, model calls. Feeds "What happened, in order"</td></tr>
+      <tr><td><code>.../&lt;test&gt;/attempt_NN/&lt;test&gt;/run_NN/replay.log</code></td><td>Grows while a test runs, one block per step. Feeds the live "Right now" box</td></tr>
+      <tr><td><code>.../run_NN/result.json</code></td><td>Written when a run ends: every step with time, retries and the error. Feeds the step table</td></tr>
+      <tr><td><code>.../run_NN/failure/</code></td><td>Screenshot, screen dump and phone log of the failed step</td></tr>
+      <tr><td><code>data/nightly/&lt;night&gt;/report.md</code></td><td>The morning report, written at the end of a night</td></tr>
+      <tr><td><code>suites/&lt;suite&gt;/.runs/&lt;time&gt;/</code></td><td>The same layout for a plain suite run</td></tr>
+    </tbody>
+  </table>
+  <div class="note">The dashboard judges a test by that test's own run, not by the nightly's summary line. If the two disagree it says so on the row.</div>
+</div>
+
+<div class="card">
+  <h2>7. Words used on the dashboard</h2>
+  <ul>
+    <li><b>Test</b>: a recording with checks. It passes or fails.</li>
+    <li><b>Flow</b>: a reusable recording (log in, close popups) that tests call.</li>
+    <li><b>Suite</b>: a folder of tests and flows for one feature, with its order and settings in <code>suite.json</code>.</li>
+    <li><b>Setup test / seed</b>: a test whose job is to create data for later tests.</li>
+    <li><b>Needs</b>: "run this other test before me".</li>
+    <li><b>Reuse</b>: skip the setup test because its data from earlier tonight is still fresh.</li>
+    <li><b>Attempt</b>: one try at a whole test by the nightly supervisor.</li>
+    <li><b>Recover</b>: what the supervisor does between two attempts to put the phone back in a good state.</li>
+    <li><b>Triage</b>: the local model's short diagnosis after a test has failed for good.</li>
+    <li><b>ANR</b>: "app not responding", the app froze for a moment.</li>
+  </ul>
+</div>
+</div>
+</body>
+</html>

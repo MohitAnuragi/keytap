@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Test Run Dashboard</title>
+<style>
+:root {
+  --bg: #f4f5f7; --card: #ffffff; --ink: #1c2330; --muted: #667085; --line: #e3e6ec;
+  --pass: #1a7f4b; --pass-bg: #e3f4ea; --fail: #c0362c; --fail-bg: #fbe7e5;
+  --warn: #a15c00; --warn-bg: #fdf0d8; --run: #1f5fbf; --run-bg: #e3edfb;
+  --idle: #667085; --idle-bg: #eceef2; --accent: #1f5fbf;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #12151b; --card: #1b2029; --ink: #e8ebf1; --muted: #98a2b3; --line: #2b323f;
+    --pass: #5fd08f; --pass-bg: #163325; --fail: #ff8a80; --fail-bg: #3a1c1a;
+    --warn: #f2b45a; --warn-bg: #3a2a10; --run: #7db1ff; --run-bg: #172a47;
+    --idle: #98a2b3; --idle-bg: #262c38; --accent: #7db1ff;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif; }
+a { color: var(--accent); }
+.wrap { max-width: 1180px; margin: 0 auto; padding: 0 16px 60px; }
+header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; padding: 18px 0 8px; }
+h1 { font-size: 20px; margin: 0; }
+nav a { margin-right: 16px; font-weight: 600; text-decoration: none; }
+nav a.cur { border-bottom: 2px solid var(--accent); }
+select { background: var(--card); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; font: inherit; max-width: 100%; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin: 14px 0; }
+.banner { display: flex; gap: 14px; align-items: center; }
+.banner .big { font-size: 18px; font-weight: 650; }
+.banner .sub { color: var(--muted); }
+.dot { width: 12px; height: 12px; border-radius: 50%; flex: none; background: var(--idle); }
+.dot.running { background: var(--run); animation: pulse 1.2s infinite; }
+.dot.pass { background: var(--pass); } .dot.fail { background: var(--fail); } .dot.warn { background: var(--warn); }
+@keyframes pulse { 50% { opacity: .35; } }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin: 14px 0; }
+.stat { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 10px 14px; }
+.stat b { display: block; font-size: 24px; line-height: 1.2; }
+.stat span { color: var(--muted); font-size: 13px; }
+.pill { display: inline-block; padding: 2px 10px; border-radius: 99px; font-size: 13px; font-weight: 600; white-space: nowrap; }
+.pill.pass, .pill.recovered { background: var(--pass-bg); color: var(--pass); }
+.pill.fail { background: var(--fail-bg); color: var(--fail); }
+.pill.warn, .pill.between_attempts, .pill.stopped { background: var(--warn-bg); color: var(--warn); }
+.pill.running { background: var(--run-bg); color: var(--run); }
+.pill.pending, .pill.not_run, .pill.skipped_policy, .pill.interrupted { background: var(--idle-bg); color: var(--idle); }
+.bar { height: 10px; background: var(--idle-bg); border-radius: 99px; overflow: hidden; margin: 8px 0; }
+.bar > i { display: block; height: 100%; background: var(--run); transition: width .4s; }
+.now h2 { margin: 0 0 4px; font-size: 16px; }
+.now .step { font-size: 17px; font-weight: 600; margin: 6px 0; }
+.chips span { display: inline-block; margin: 2px 6px 2px 0; padding: 2px 10px; border-radius: 8px; font-size: 13px; background: var(--idle-bg); }
+.chips .retry { background: var(--warn-bg); color: var(--warn); font-weight: 600; }
+.chips .look { background: var(--run-bg); color: var(--run); }
+pre.log { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font: 12px/1.45 ui-monospace, Menlo, monospace; overflow: auto; max-height: 180px; margin: 8px 0 0; white-space: pre-wrap; }
+table { width: 100%; border-collapse: collapse; }
+th { text-align: left; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; padding: 6px 8px; }
+td { padding: 8px; border-top: 1px solid var(--line); vertical-align: top; }
+tr.test { cursor: pointer; }
+tr.test:hover { background: var(--bg); }
+.name { font-weight: 600; overflow-wrap: anywhere; }
+#tests table > thead th:nth-child(2) { width: 38%; }
+#tests table > thead th:nth-child(1) { width: 28px; }
+.desc { color: var(--muted); font-size: 13px; }
+.att { display: inline-block; margin: 0 4px 2px 0; padding: 0 8px; border-radius: 6px; font-size: 12px; font-weight: 600; }
+.att.pass { background: var(--pass-bg); color: var(--pass); } .att.fail { background: var(--fail-bg); color: var(--fail); }
+.att.warn { background: var(--warn-bg); color: var(--warn); } .att.running { background: var(--run-bg); color: var(--run); }
+.detail { background: var(--bg); }
+.detail td { padding: 12px 14px; }
+.attempt { border: 1px solid var(--line); background: var(--card); border-radius: 10px; padding: 10px 12px; margin: 8px 0; }
+.attempt h4 { margin: 0 0 6px; font-size: 14px; }
+.runrow { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 4px 0; cursor: pointer; }
+.runrow:hover .rn { text-decoration: underline; }
+.rn { font-weight: 600; }
+.muted { color: var(--muted); }
+.steps td { padding: 4px 8px; font-size: 13px; }
+.steps tr.failed td { background: var(--fail-bg); }
+.steps tr.retried td { background: var(--warn-bg); }
+.steps tr.skip td { color: var(--muted); }
+.steps tr.running td { background: var(--run-bg); }
+.steps .lbl { word-break: break-word; }
+.err { color: var(--fail); font-size: 12px; word-break: break-word; }
+.shot { max-height: 360px; border: 1px solid var(--line); border-radius: 8px; margin-top: 8px; }
+.timeline { max-height: 340px; overflow: auto; }
+.ev { padding: 5px 0; border-top: 1px solid var(--line); font-size: 14px; }
+.ev:first-child { border-top: 0; }
+.ev time { color: var(--muted); font-variant-numeric: tabular-nums; margin-right: 8px; }
+.ev.bad { color: var(--fail); } .ev.good { color: var(--pass); }
+.hist a { display: flex; justify-content: space-between; gap: 8px; padding: 6px 4px; border-top: 1px solid var(--line); text-decoration: none; color: var(--ink); cursor: pointer; }
+.hist a:hover { background: var(--bg); }
+.hist a.sel { background: var(--run-bg); }
+label.tog { font-size: 13px; color: var(--muted); }
+@media (max-width: 720px) { .hide-sm { display: none; } td, th { padding: 6px 4px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <div>
+    <h1>Test Run Dashboard</h1>
+    <nav><a href="/" class="cur">Dashboard</a><a href="/flow">How a run works</a></nav>
+  </div>
+  <div><label class="muted">Showing: <select id="viewSel"></select></label></div>
+</header>
+
+<div id="banner" class="card banner"></div>
+<div id="stats" class="stats"></div>
+<div id="now"></div>
+<div id="tests"></div>
+
+<div class="card">
+  <h3 style="margin-top:0">What happened, in order</h3>
+  <div id="timeline" class="timeline"><span class="muted">Nothing yet.</span></div>
+</div>
+<div class="card hist">
+  <h3 style="margin-top:0">Earlier runs</h3>
+  <div id="hist"></div>
+</div>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const state = { sel: "auto", open: new Set(), openRun: null, overview: null, view: null, showSkips: false, stepsCache: {} };
+
+const CAUSE = {
+  action_failed: "A step did not work",
+  assertion_failed: "A check failed: the screen did not show what the test expected",
+  element_not_found: "A button or text the test needed was not on the screen",
+  app_crash: "The app crashed or hung (ANR)",
+  wrong_app_in_foreground: "Another app was in front",
+  device_unavailable: "The phone could not be reached",
+  timeout: "The test took too long",
+  runner_error: "The test runner itself broke",
+  load_error: "The test file could not be loaded",
+};
+const STATUS = {
+  pass: "Passed", fail: "Failed", warn: "Passed, but its seed failed", recovered: "Passed after a retry",
+  running: "Running", between_attempts: "Waiting to retry", pending: "Waiting", stopped: "Stopped midway",
+  not_run: "Not run", skipped_policy: "Skipped (unsafe step)", interrupted: "Interrupted",
+};
+const fmtT = (s) => { if (s == null) return ""; s = Math.round(s); const m = Math.floor(s / 60); return m ? `${m}m ${String(s % 60).padStart(2, "0")}s` : `${s}s`; };
+const clock = (t) => t ? new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
+
+// "element_tap: Log in" -> "Tap 'Log in'"
+function plain(label) {
+  if (!label) return "";
+  let m;
+  if ((m = label.match(/^element_tap: (.*)$/))) return `Tap "${m[1]}"`;
+  if ((m = label.match(/^input_text: (.*)$/))) return `Type ${m[1]}`;
+  if ((m = label.match(/^assert (\w+) (.*)$/))) {
+    const k = { visible: "is on screen", gone: "is gone", text_equals: "has exactly this text", text_contains: "contains", count: "appears this many times" }[m[1]] || m[1];
+    return `Check that ${m[2]} ${k}`;
+  }
+  if ((m = label.match(/^wait: (\d+)ms/))) return `Wait ${m[1] / 1000} s`;
+  if ((m = label.match(/^force_stop/))) return "Close the app";
+  if ((m = label.match(/^launch/))) return "Open the app";
+  if ((m = label.match(/^clear_data/))) return "Wipe the app's data (logs the account out)";
+  if ((m = label.match(/^permission/))) return "Grant the app its permissions";
+  return label;
+}
+
+async function api(path) { const r = await fetch(path, { cache: "no-store" }); if (!r.ok) throw new Error(path); return r.json(); }
+
+function viewKey(v) { return v.kind === "night" ? "night:" + v.id : "run:" + v.suite + "/" + v.id; }
+function viewUrl(key) {
+  if (key.startsWith("night:")) return "/api/view?kind=night&id=" + encodeURIComponent(key.slice(6));
+  const [suite, id] = key.slice(4).split("/");
+  return "/api/view?kind=run&suite=" + encodeURIComponent(suite) + "&id=" + encodeURIComponent(id);
+}
+
+function renderSelector(ov) {
+  const sel = $("viewSel"), cur = sel.value;
+  let h = `<option value="auto">Live (follows what is running)</option><optgroup label="Nightly runs">`;
+  ov.nights.forEach((n) => { h += `<option value="night:${n.id}">Night ${n.id}${n.finished ? "" : " (not finished)"}</option>`; });
+  h += `</optgroup><optgroup label="Suite runs">`;
+  ov.runs.forEach((r) => { h += `<option value="run:${r.suite}/${r.id}">${esc(r.suite)} ${r.id}</option>`; });
+  h += `</optgroup>`;
+  sel.innerHTML = h; sel.value = state.sel;
+}
+
+function renderHistory(ov, key) {
+  let h = "";
+  ov.nights.forEach((n) => {
+    const k = "night:" + n.id, c = n.counts || {};
+    const sum = n.finished ? `${c.pass || 0} passed, ${c.fail || 0} failed${c.recovered ? ", " + c.recovered + " recovered" : ""}` : "not finished";
+    h += `<a data-k="${k}" class="${k === key ? "sel" : ""}"><span>Nightly ${n.id}</span><span class="muted">${sum}${n.duration ? " - " + fmtT(n.duration) : ""}</span></a>`;
+  });
+  ov.runs.slice(0, 12).forEach((r) => {
+    const k = "run:" + r.suite + "/" + r.id, t = r.totals;
+    h += `<a data-k="${k}" class="${k === key ? "sel" : ""}"><span>${esc(r.suite)} run ${r.id}</span><span class="muted">${t ? t.passed + " of " + t.tests + " passed" : "not finished"}${r.duration ? " - " + fmtT(r.duration) : ""}</span></a>`;
+  });
+  $("hist").innerHTML = h || '<span class="muted">No runs yet.</span>';
+  $("hist").querySelectorAll("a").forEach((a) => a.onclick = () => { state.sel = a.dataset.k; $("viewSel").value = state.sel; refresh(); });
+}
+
+function renderBanner(v, ov) {
+  const total = v.suites.reduce((n, s) => n + s.tests.length, 0);
+  const done = v.suites.reduce((n, s) => n + s.tests.filter((t) => ["pass", "fail", "warn", "recovered", "skipped_policy"].includes(t.status)).length, 0);
+  const procs = ov.processes.map((p) => p.kind + " (running " + p.elapsed + ")").join(", ");
+  let cls = "", big = "", sub = "";
+  const name = v.kind === "night" ? "Nightly run " + v.id : "Suite run " + v.id;
+  if (v.alive) {
+    cls = "running"; big = "Running now";
+    sub = v.now ? `Test ${v.suites[0].tests.findIndex((t) => t.name === v.now.test) + 1} of ${total}: ${v.now.test}` : `${done} of ${total} tests finished`;
+  } else if (v.ended || v.counts.pass || v.counts.fail) {
+    const bad = (v.counts.fail || 0) + (v.counts.warn || 0);
+    cls = bad ? "fail" : "pass";
+    big = v.ended ? (bad ? "Finished with problems" : "Finished, everything passed") : (bad ? "Stopped early, with problems" : "Stopped early");
+    sub = v.duration ? `Took ${fmtT(v.duration)}` : "";
+  } else { big = "Idle"; sub = "Nothing is running."; }
+  $("banner").innerHTML = `<div class="dot ${cls}"></div><div style="flex:1"><div class="big">${esc(big)} <span class="muted" style="font-weight:400">${esc(name)}</span></div><div class="sub">${esc(sub)}${v.abort ? " | Aborted: " + esc(v.abort) : ""}${procs ? " | Processes: " + esc(procs) : ""}</div></div>`;
+}
+
+function renderStats(v) {
+  const c = v.counts, g = (k) => c[k] || 0;
+  const reused = v.suites.reduce((n, s) => n + s.tests.filter((t) => t.reused && t.reused.length).length, 0);
+  const cells = [
+    ["Passed", g("pass") + g("recovered")], ["Failed", g("fail")], ["Passed with a warning", g("warn")],
+    ["Running", g("running") + g("between_attempts")], ["Waiting", g("pending")], ["Not run / stopped", g("not_run") + g("stopped")],
+    ["Groups created", v.groups_created], ["Seed reused", reused],
+  ];
+  $("stats").innerHTML = cells.map(([l, n]) => `<div class="stat"><b>${n}</b><span>${l}</span></div>`).join("");
+}
+
+function renderNow(v) {
+  const n = v.now;
+  if (!n) { $("now").innerHTML = ""; return; }
+  const cur = n.current || {};
+  const prereq = n.in_test !== n.test;
+  const pct = n.total ? Math.round((100 * n.step) / n.total) : 0;
+  const chips = [];
+  if (cur.retries) chips.push(`<span class="retry">Step failed - retry ${cur.retries} of ${cur.retry_max}</span>`);
+  if (cur.retaps) chips.push(`<span class="retry">Tapped again ${cur.retaps}x because the screen did not change</span>`);
+  if (cur.waiting) chips.push(`<span class="look">Waiting for the element to appear</span>`);
+  if (n.attempt > 1) chips.push(`<span class="retry">Attempt ${n.attempt} of ${v.max_attempts}</span>`);
+  if (prereq) chips.push(`<span>Preparing data first: running "${esc(n.in_test)}"</span>`);
+  const note = (cur.notes || []).slice(-2).map((x) => `<div class="muted">${esc(x)}</div>`).join("");
+  $("now").innerHTML = `<div class="card now">
+    <h2>Right now: ${esc(n.test)}</h2>
+    <div class="desc">${esc(n.desc || "")}</div>
+    <div class="step">Step ${n.step} of ${n.total || "?"}: ${esc(plain(cur.label || "starting up"))}</div>
+    <div class="bar"><i style="width:${pct}%"></i></div>
+    <div class="chips">${chips.join("")}</div>${note}
+    <pre class="log">${esc((n.tail || []).join("\n"))}</pre></div>`;
+  const pre = $("now").querySelector("pre"); pre.scrollTop = pre.scrollHeight;
+}
+
+function whatHappened(t) {
+  if (t.status === "skipped_policy") return "Not run: " + esc(t.skip_why || "uses a step that is unsafe overnight");
+  const last = t.attempts[t.attempts.length - 1];
+  const bits = [];
+  if (t.reused && t.reused.length) bits.push("Reused the data from " + t.reused.map(esc).join(", ") + " (skipped a 4-5 minute setup)");
+  if (last && (t.status === "fail" || t.status === "warn" || last.status === "fail")) {
+    const failedRun = last.runs.find((r) => r.state === "fail");
+    if (failedRun && failedRun.failure) bits.push(esc(CAUSE[failedRun.failure.cause] || failedRun.failure.cause) + (failedRun.test !== t.name ? " (in the setup test " + esc(failedRun.test) + ")" : ""));
+    else if (last.cause) bits.push(esc(CAUSE[last.cause] || last.cause));
+  }
+  if (t.attempts.length > 1) bits.push(t.attempts.length + " attempts");
+  if (t.status === "warn") bits.push("The test itself passed, but the setup it needed failed");
+  const mism = (last || {}).supervisor_status && last.supervisor_status !== last.status && last.status !== "running";
+  if (mism) bits.push("The nightly's own record says " + esc(last.supervisor_status) + " - the dashboard shows what the test itself did");
+  return bits.join(". ") || "";
+}
+
+function runLabel(r, test) { return r.test === test ? "The test itself" : "Setup needed first: " + r.test; }
+
+function renderTests(v) {
+  let h = "";
+  v.suites.forEach((s) => {
+    h += `<div class="card"><h3 style="margin:0 0 4px">${esc(s.name)}</h3><div class="muted" style="margin-bottom:8px">${esc(s.package)} - tests run in this order</div><table><thead><tr><th>#</th><th>Test</th><th>Status</th><th class="hide-sm">Attempts</th><th>What happened</th></tr></thead><tbody>`;
+    s.tests.forEach((t, i) => {
+      const key = s.name + "/" + t.name, open = state.open.has(key);
+      const atts = t.attempts.map((a) => `<span class="att ${a.status}">${a.n}: ${esc(({ pass: "pass", fail: "fail", warn: "warn", running: "running" })[a.status] || a.status)}</span>`).join("");
+      h += `<tr class="test" data-key="${esc(key)}"><td>${i + 1}</td><td><div class="name">${esc(t.name)}</div><div class="desc">${esc(t.desc)}</div></td>
+        <td><span class="pill ${t.status}">${STATUS[t.status] || t.status}</span></td><td class="hide-sm">${atts}</td><td>${whatHappened(t)}</td></tr>`;
+      if (open) h += `<tr class="detail"><td colspan="5">${renderDetail(t)}</td></tr>`;
+    });
+    h += `</tbody></table></div>`;
+  });
+  $("tests").innerHTML = h;
+  $("tests").querySelectorAll("tr.test").forEach((tr) => tr.onclick = () => { const k = tr.dataset.key; state.open.has(k) ? state.open.delete(k) : state.open.add(k); renderTests(state.view); loadOpenRun(); });
+  $("tests").querySelectorAll("[data-run]").forEach((el) => el.onclick = (e) => { e.stopPropagation(); state.openRun = state.openRun === el.dataset.run ? null : el.dataset.run; renderTests(state.view); loadOpenRun(); });
+  $("tests").querySelectorAll("[data-skips]").forEach((el) => el.onchange = () => { state.showSkips = el.checked; renderTests(state.view); loadOpenRun(); });
+}
+
+function renderDetail(t) {
+  if (!t.attempts.length) return `<span class="muted">${t.needs.length ? "This test needs " + t.needs.map(esc).join(", ") + " first. " : ""}It has not started yet.</span>`;
+  let h = t.needs.length ? `<div class="muted">This test needs <b>${t.needs.map(esc).join(", ")}</b> to have run first (it creates the data this test looks at).</div>` : "";
+  t.attempts.forEach((a) => {
+    h += `<div class="attempt"><h4>Attempt ${a.n} <span class="pill ${a.status}">${STATUS[a.status] || a.status}</span>
+      ${a.reused ? '<span class="muted"> - setup skipped, reused earlier data</span>' : ""}</h4>`;
+    if (a.cause) h += `<div class="err">${esc(CAUSE[a.cause] || a.cause)}${a.detail ? " - " + esc(a.detail) : ""}</div>`;
+    a.runs.forEach((r) => {
+      const open = state.openRun === r.dir;
+      h += `<div class="runrow" data-run="${esc(r.dir)}"><span class="pill ${r.state}">${STATUS[r.state] || r.state}</span><span class="rn">${esc(runLabel(r, t.name))}</span>
+        <span class="muted">step ${r.step} of ${r.total || "?"}${r.duration != null ? " - " + fmtT(r.duration) : ""}${r.create_groups ? " - created " + r.create_groups + " group(s)" : ""}${r.retried ? " - " + r.retried + " step(s) needed a retry" : ""}${r.anr ? " - the app hung (ANR) but the steps passed" : ""}</span></div>`;
+      if (r.failure && r.state === "fail") h += `<div class="err">Failed at step ${esc(r.failure.step)}: ${esc(plain(r.failure.action))} - ${esc(CAUSE[r.failure.cause] || r.failure.cause)}</div>`;
+      if (open) h += `<div id="steps-box">${state.stepsCache[r.dir] || '<span class="muted">Loading steps...</span>'}</div>`;
+    });
+    h += `</div>`;
+  });
+  return h;
+}
+
+async function loadOpenRun() {
+  const box = document.getElementById("steps-box");
+  if (!box || !state.openRun) return;
+  try {
+    const d = await api("/api/steps?dir=" + encodeURIComponent(state.openRun));
+    let h = `<label class="tog"><input type="checkbox" data-skips ${state.showSkips ? "checked" : ""}> show skipped steps</label>
+      <table class="steps"><thead><tr><th>#</th><th>What the step does</th><th class="hide-sm">Part of</th><th>Time</th><th>Result</th></tr></thead><tbody>`;
+    d.steps.forEach((s) => {
+      if (s.status === "skip" && !state.showSkips) return;
+      const failed = s.status === "fail", retried = s.retries > 0 && !failed;
+      const cls = failed ? "failed" : s.status === "running" ? "running" : retried ? "retried" : s.status === "skip" ? "skip" : "";
+      const res = failed ? "Failed" : s.status === "running" ? "Running" + (s.waiting ? " (waiting for it)" : "") : s.status === "skip" ? "Skipped" : s.status === "warn" ? "Warning" : retried ? `Passed after ${s.retries} retr${s.retries > 1 ? "ies" : "y"}` : "Passed";
+      h += `<tr class="${cls}"><td>${s.n}</td><td class="lbl">${esc(plain(s.label))}${s.error ? `<div class="err">${esc(s.error)}</div>` : ""}</td><td class="hide-sm muted">${esc(s.origin)}</td><td>${s.ms != null ? (s.ms / 1000).toFixed(1) + "s" : ""}</td><td>${res}</td></tr>`;
+    });
+    h += `</tbody></table>`;
+    const run = findRun(state.openRun);
+    if (run && run.screenshot) h += `<div><img class="shot" alt="screen at the failure" src="/file?p=${encodeURIComponent(run.screenshot)}"></div>`;
+    if (!d.done && d.tail.length) h += `<pre class="log">${esc(d.tail.join("\n"))}</pre>`;
+    state.stepsCache[state.openRun] = h;
+    box.innerHTML = h;
+    box.querySelector("[data-skips]").onchange = (e) => { state.showSkips = e.target.checked; loadOpenRun(); };
+  } catch (e) { box.innerHTML = `<span class="err">Could not load the steps.</span>`; }
+}
+function findRun(dir) {
+  for (const s of state.view.suites) for (const t of s.tests) for (const a of t.attempts) for (const r of a.runs) if (r.dir === dir) return r;
+  return null;
+}
+
+function narrate(e) {
+  const t = e.test ? `"${e.test}"` : "";
+  switch (e.event) {
+    case "start": return [`The night started${e.serial ? " on phone " + e.serial : ""}.`, ""];
+    case "build": return [`App build under test: ${e.build}`, ""];
+    case "reuse": return [`${t} reuses the data created earlier by ${(e.skipped_needs || []).join(", ")}, so no new groups are made for it.`, "good"];
+    case "attempt": {
+      if (e.status === "pass") return [`Attempt ${e.n} of ${t} passed.`, "good"];
+      return [`Attempt ${e.n} of ${t} failed: ${CAUSE[e.cause] || e.cause}${e.detail ? " (" + e.detail.slice(0, 140) + ")" : ""}`, "bad"];
+    }
+    case "recover": return [`Getting ready to retry ${t}: ` + ({ wait: "waiting 30 s for the phone", navigate: "asking the local model to get the app back in front", restart_app: "restarting the app" }[e.action] || e.action) + ".", ""];
+    case "navigate": return [`The model looked at the screen and ${e.verified === true || e.verified === "True" ? "confirmed" : "could not confirm"} the app was ready (${e.seconds} s, actions: ${(e.steps || []).join(", ") || "none"}).`, ""];
+    case "llm": return [`Model's diagnosis of ${(e.what || "").replace(/^triage .*\//, "")}: ${(e.answer || "").toString().slice(0, 260)}`, ""];
+    case "skip": return [`${t} was skipped: ${e.why}`, ""];
+    case "stop_identical": return [`${t} failed the same way twice, so no more attempts.`, "bad"];
+    case "abort": return [`The night was aborted: ${e.why}`, "bad"];
+    case "end": return [`The night finished after ${fmtT(e.duration_s)}.`, ""];
+    default: return [e.event + " " + JSON.stringify(e).slice(0, 120), ""];
+  }
+}
+function renderTimeline(v) {
+  if (!v.events.length) { $("timeline").innerHTML = '<span class="muted">This is a plain suite run: it has no nightly event log. Open a test above to see its steps.</span>'; return; }
+  $("timeline").innerHTML = v.events.map((e) => { const [txt, cls] = narrate(e); return `<div class="ev ${cls}"><time>${esc(e.t)}</time>${esc(txt)}</div>`; }).join("");
+}
+
+async function refresh() {
+  try {
+    const ov = await api("/api/overview");
+    state.overview = ov;
+    let key = state.sel;
+    if (key === "auto") key = ov.default ? viewKey(ov.default) : null;
+    renderSelector(ov);
+    if (!key) { $("banner").innerHTML = '<div class="dot"></div><div class="big">No runs found yet</div>'; return; }
+    const v = await api(viewUrl(key));
+    state.view = v;
+    renderBanner(v, ov); renderStats(v); renderNow(v); renderTests(v); renderTimeline(v); renderHistory(ov, key);
+    loadOpenRun();
+  } catch (e) { $("banner").innerHTML = `<div class="dot fail"></div><div class="big">Cannot reach the dashboard server</div><div class="sub">Start it with ./dashboard.py</div>`; }
+}
+$("viewSel").onchange = (e) => { state.sel = e.target.value; refresh(); };
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

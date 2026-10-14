@@ -125,6 +125,7 @@ def run_once(rec, opts, run_dir, package, health, say):
     def on_status(msg):
         say("  " + msg, flush=True)
         log.write(msg + "\n")
+        log.flush()   # so the dashboard can follow the run live
 
     try:
         adb("logcat", "-c")   # so a crash found afterwards happened during this run

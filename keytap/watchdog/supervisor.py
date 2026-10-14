@@ -115,7 +115,13 @@ def run_test(suite_dir, name, out, cfg, skip=()):
     if not os.path.isfile(path):
         return {**fail, "cause": "runner_error", "detail": (p.stdout + p.stderr).strip()[-300:]}
     with open(path) as f:
-        return json.load(f)["tests"][0]
+        tests = json.load(f)["tests"]
+    # suite.py runs the prerequisites (needs) first, so the requested test is not always tests[0]
+    mine = next((t for t in tests if t["name"] == name), tests[-1])
+    bad = next((t for t in tests if t is not mine and t["status"] == "fail"), None)
+    if bad:   # a failed prerequisite is the root cause, and the test after it ran on missing data
+        return {**bad, "detail": f'prerequisite {bad["name"]} failed: {bad.get("detail", "")}'[:300]}
+    return mine
 
 
 def build_id(package):
