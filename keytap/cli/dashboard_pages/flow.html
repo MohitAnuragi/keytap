@@ -147,13 +147,10 @@ ul { margin: 6px 0; padding-left: 20px; }
       <tr><td>1</td><td><code>gi_login_as_hardeep</code></td><td>Logs in as Hardeep and checks Home shows</td><td></td></tr>
       <tr><td>2</td><td><code>gi_login_as_siddharth</code></td><td>Same for Siddharth</td><td></td></tr>
       <tr><td>3</td><td><code>gi_popups_dismissed_on_home</code></td><td>First-run popups are closed when present</td><td></td></tr>
-      <tr><td>4</td><td><code>gi_invite_hardeep_invites_siddharth</code></td><td><b>The setup test.</b> Hardeep creates 3 groups and invites Siddharth to each, then Siddharth logs in and the newest invitation is checked</td><td></td></tr>
-      <tr><td>5-8</td><td>Four card tests</td><td>Only look at Siddharth's invitations card: it shows, it is hidden on other tabs, it collapses and expands, View all lists everything</td><td>Test 4 (they reuse its data)</td></tr>
-      <tr><td>9</td><td><code>gi_decline_invitation_removes_it</code></td><td>Creates its own invitation, declines it, checks it disappears</td><td>Nothing (self-contained)</td></tr>
-      <tr><td>10</td><td><code>gi_accept_invitation_joins_group</code></td><td>Creates its own invitation, accepts it, checks Siddharth lands in the group</td><td>Nothing (self-contained)</td></tr>
+      <tr><td>4</td><td><code>gi_invitations_end_to_end</code></td><td><b>One test for everything after login.</b> Hardeep creates 3 groups and invites Siddharth to each, then in one Siddharth session: the card shows (title, name, invited by, buttons), it is hidden on All Chats and Drivers, it collapses and expands, View all lists them and back returns, the newest invitation is declined, the next one is accepted and Siddharth lands in its group chat</td><td>Nothing (self-contained)</td></tr>
     </tbody>
   </table>
-  <p style="margin-top:12px"><b>The setup test, step by step</b></p>
+  <p style="margin-top:12px"><b>The end-to-end test, step by step</b></p>
   <div class="row">
     <div class="box"><span class="n">1</span>Log in as Hardeep</div>
     <div class="box"><span class="n">2</span>Create group a, invite Siddharth, restart the app</div>
@@ -161,6 +158,8 @@ ul { margin: 6px 0; padding-left: 20px; }
     <div class="box"><span class="n">4</span>Create group c, invite</div>
     <div class="box"><span class="n">5</span>Log in as Siddharth</div>
     <div class="box"><span class="n">6</span>Open the Groups tab, check the newest invitation is group c</div>
+    <div class="box"><span class="n">7</span>Card checks, tab checks, collapse and expand, View all and back</div>
+    <div class="box"><span class="n">8</span>Decline group c, accept group b, check the group chat</div>
   </div>
   <div class="note">Invitations only appear if each account's "Auto-join groups" privacy setting is OFF (Profile, Privacy settings). With it ON, people are added to the group directly and no card is ever created.</div>
   <div class="note">Every test run leaves real groups and pending invitations on the test accounts. They pile up, which can change what the card shows after a while. The dashboard's "Groups created" counter shows how many a run made.</div>
