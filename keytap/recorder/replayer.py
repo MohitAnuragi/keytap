@@ -242,6 +242,8 @@ class ActionReplayer:
             alts = [ElementSelector(**w) for w in action.when_else]
             winner = self._wait_for_first(self._u2_dev, [sel] + alts, timeout_s)
             if winner == 0:
+                if self._on_status:
+                    self._on_status(f"[WHEN] '{self._describe(sel)}' is on screen, running the step")
                 return None, True, None
             self._skip_left = (action.when_span or 1) - 1
             if winner is not None:
@@ -386,6 +388,10 @@ class ActionReplayer:
                     actions.tap(cx, cy)
                 return True, None
 
+        if action.when and dev is not None and self._on_status:   # `when` saw it, the tap did not: say what is there
+            self._on_status(f"[WHEN-MISS] '{self._describe(sel)}' was on screen for `when` but not for the tap; "
+                            f"screen now: {self._screen_texts(dev)}")
+
         # a screen that only sometimes appears (promo, country prompt): skip, never fail or guess
         if action.optional and dev is not None and not last_exc:
             if self._on_status:
@@ -406,6 +412,17 @@ class ActionReplayer:
         if last_exc:
             return False, f"element lookup failed: {last_exc}"
         return False, f"element '{self._describe(sel)}' not found after {self._waited(recorded_s, timeout_s)}"
+
+    @staticmethod
+    def _screen_texts(dev, limit=10):
+        try:
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(dev.dump_hierarchy())
+            t = [n.get("text") or n.get("content-desc") for n in root.iter("node")
+                 if n.get("package") != "com.android.systemui" and (n.get("text") or n.get("content-desc"))]
+            return f"{dev.app_current().get('activity', '?').split('.')[-1]} {t[:limit]}"
+        except Exception as e:
+            return f"unreadable ({type(e).__name__})"
 
     MAX_RETAPS = 2        # extra taps when the screen did not change
     RETAP_WAIT_S = 1.5    # how long to watch for a change after each tap
