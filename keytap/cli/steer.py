@@ -93,11 +93,16 @@ def area(b):
 
 
 def overlay_scope(root):
-    """The topmost overlay drawn inside the app window: a clickable scrim that covers the window and sits after
-    full-size content (a popup menu or sheet over the screen). None when there is none. With several app windows
-    the smallest one is taken, on the assumption that a dialog is smaller than the screen (not seen in the saved dumps)."""
+    """(scope, kind): what `--top` keeps. kind is "dialog window" when the app-side window is smaller than the
+    screen (a system dialog such as an ANR box is its own window and the app window can be missing from the dump),
+    "top layer" when a clickable scrim covers the window and sits after full-size content (a popup menu or sheet
+    drawn inside the window), else "" for the whole screen. With several app windows the smallest is taken."""
     wins = [w for w in root if w.get("package") != "com.android.systemui"] or list(root)
     win = min(wins, key=lambda w: area(parse_bounds(w.get("bounds", "")))) if len(wins) > 1 else wins[0]
+    boxes = [parse_bounds(w.get("bounds", "")) for w in root if parse_bounds(w.get("bounds", ""))]
+    screen = area((min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes))) if boxes else 0
+    if screen and area(parse_bounds(win.get("bounds", ""))) < screen * 0.95:
+        return win, "dialog window"
     full = area(parse_bounds(win.get("bounds", ""))) * 0.95
 
     def covers(n):
@@ -109,15 +114,15 @@ def overlay_scope(root):
         for i, k in enumerate(kids):
             if i and len(k) and k.get("clickable") == "true" and covers(k) and any(covers(e) for e in kids[:i]):
                 scrim = k   # document order, so the last one is the topmost
-    return scrim
+    return (list(scrim), "top layer") if scrim is not None else (None, "")
 
 
 def digest(xml, top=False):
-    """([(tappable, label, (cx, cy))], overlay_found) in document order. A tappable container takes the labels of
+    """([(tappable, label, (cx, cy))], kind) in document order. A tappable container takes the labels of
     everything inside it (a list row reads "Name / last message / time"); plain text is listed once, without a number.
     top=True keeps only the topmost overlay (see overlay_scope), or the whole screen when there is none."""
     root = ET.fromstring(xml)
-    scope = overlay_scope(root) if top else None
+    scope, kind = overlay_scope(root) if top else (None, "")
     nodes = list(root.iter("node"))
     # the status bar and nav buttons are never what the caller wants, unless nothing else is on screen
     skip = "com.android.systemui" if any(n.get("package") != "com.android.systemui" for n in nodes) else None
@@ -155,9 +160,9 @@ def digest(xml, top=False):
         for c in n:
             walk(c)
 
-    for start in (list(scope) if scope is not None else [root]):
+    for start in ([scope] if kind == "dialog window" else scope if scope is not None else [root]):
         walk(start)
-    return out, scope is not None
+    return out, kind
 
 
 def render(items, fg, find=None, note=""):
@@ -188,9 +193,9 @@ def snapshot(state, quiet_if_same, find=None, top=False):
     """Read the screen, keep it in the state for `tap`, and return the text to print. --top keeps only the topmost
     overlay (the numbers then refer to it); --find only filters what is printed, the numbers stay the screen's own."""
     xml = hierarchy()
-    items, overlay = digest(xml, top)
+    items, kind = digest(xml, top)
     taps = [i for i in items[:STATE_LINES] if i[0]]
-    note = (" [top layer]" if overlay else " [no overlay found: whole screen]") if top else ""
+    note = (f" [{kind}]" if kind else " [no overlay found: whole screen]") if top else ""
     fg = foreground()
     text = render(items, fg, note=note)
     sig = hashlib.md5(text.encode()).hexdigest()
