@@ -39,6 +39,6 @@ Every action prints the new screen, or `screen unchanged`. Add `--quiet` to any 
 1. `screen` once, then act. Do not call `screen` again after an action, its output already holds the result.
 2. Prefer `tap "label"` over numbers when the label is unique: it survives a re-render.
 3. Clickstream or any logged-event check: `mark`, run the flow, then `logs "<event name or tag>"`. Read the count and the sample, not the whole log. If `0 matches`, widen the regex once before concluding the event did not fire.
-4. The screen text is the source of truth for what is on screen. Use `see` only for things the tree cannot say (colors, icons without a label, overlap, whether something is visibly cut off), and treat its answer as a hint.
+4. The screen text is the source of truth for what is on screen. Use `see` only for things the tree cannot say (colors, icons without a label, overlap, whether something is visibly cut off), and treat its answer as a hint. It is unreliable for state such as which tab is selected: on a real screen it named the big Pay button as the selected tab when Chat was. Verify state from the screen text or by acting.
 5. Do not tap anything about money or deletion without an explicit yes from the user.
 6. Stop and report when `screen` fails with "no hierarchy" (phone missing, locked, or uiautomator busy). Do not start a suite run while steering.

@@ -376,7 +376,7 @@ def cmd_see(a, state):
 
 
 def cmd_mark(a, state):
-    state["mark"] = adb("shell", "date", "+%m-%d %H:%M:%S.000").strip()
+    state["mark"] = adb("shell", "date '+%m-%d %H:%M:%S.000'").strip()
     SAVED_LOG.unlink(missing_ok=True)
     save_state(state)
     print(f"marked {state['mark']}")
