@@ -135,7 +135,7 @@ For a one-time check (run a flow, see what a screen shows) a test suite is overk
 ./steer.py mark ; ./steer.py logs "regex"  count and a few logcat lines since the mark
 ```
 
-Add `--quiet` to any action to print one line instead of the screen. The `steer-phone` Claude skill (in `skills/`) teaches an AI to use this instead of raw dumps. `see` can be wrong about state such as the selected tab; trust the screen text first.
+Add `--quiet` to any action to print one line instead of the screen. `--find "regex"` prints only the matching lines (the numbers stay the screen's own, so `tap` still works) and `--top` prints only the topmost menu or sheet (renumbered from 1). The `steer-phone` Claude skill (in `skills/`) teaches an AI to use this instead of raw dumps. `see` can be wrong about state such as the selected tab; trust the screen text first.
 
 ### Step options (in `actions.json`)
 

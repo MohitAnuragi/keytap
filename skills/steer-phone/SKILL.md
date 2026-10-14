@@ -26,6 +26,8 @@ KEYTAP = the folder that contains `steer.py`: the current folder if `./steer.py`
 ./steer.py logs "regex" [--max 5]       match count plus a few sample lines since the mark
 ```
 
+Every command that prints the screen takes two filters. `--find "regex"` prints only the lines whose label matches (case-insensitive), with the screen's own numbers, so `--find "accept|decline"` costs a few tokens on a busy screen and `tap` still works with those numbers. `--top` prints only the topmost menu or sheet drawn over the screen, renumbered from 1; if no overlay is found it says so and prints the whole screen. Prefer `--find` when you know what you are looking for.
+
 Every action prints the new screen, or `screen unchanged`. Add `--quiet` to any action and it prints one line (`ok`) instead; use it for a step whose result you do not need to read. After a quiet action the numbers are stale: tap by label, or run `screen` first. Numbers are only valid for the latest printed screen: after a screen change, read the new numbers, do not reuse old ones.
 
 ## Batching and flows

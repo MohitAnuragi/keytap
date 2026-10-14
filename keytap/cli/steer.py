@@ -17,6 +17,8 @@ Tappable lines carry a number; `tap 5` uses the numbers of the last snapshot, `t
   steer.py mark                          remember "now" in logcat
   steer.py logs "regex" [--max 5]        count and sample logcat lines since the mark (clickstream checks)
 
+Every command that prints the screen also takes --find REGEX (only matching lines, numbers unchanged) and
+--top (only the topmost menu or sheet; the numbers then refer to it).
 Every action takes --quiet: print one line instead of the screen. Numbers are then stale until the next `screen`;
 tapping by label still works, it reads the screen first.
 Set ANDROID_SERIAL to pick a phone when several are attached.
@@ -39,7 +41,8 @@ from keytap.core.utils import parse_bounds
 STATE = DATA_DIR / "steer" / "state.json"
 SAVED_LOG = DATA_DIR / "steer" / "saved_log.txt"
 MAX_LABEL = 50
-MAX_LINES = 45
+MAX_LINES = 45        # lines printed for a plain screen
+STATE_LINES = 150     # lines kept for `tap` and searched by --find
 KEYS = {"back": 4, "home": 3, "enter": 66, "recents": 187, "delete": 67, "tab": 61}
 FOCUS_RE = re.compile(r"u\d+\s+([\w.]+)/([\w.$]+)")
 
@@ -85,10 +88,36 @@ def foreground():
     return f"{m.group(1)}/{m.group(2)}"
 
 
-def digest(xml):
-    """[(tappable, label, (cx, cy))] in document order. A tappable container takes the labels of everything
-    inside it (a list row reads "Name / last message / time"); plain text is listed once, without a number."""
+def area(b):
+    return (b[2] - b[0]) * (b[3] - b[1]) if b else 0
+
+
+def overlay_scope(root):
+    """The topmost overlay drawn inside the app window: a clickable scrim that covers the window and sits after
+    full-size content (a popup menu or sheet over the screen). None when there is none. With several app windows
+    the smallest one is taken, on the assumption that a dialog is smaller than the screen (not seen in the saved dumps)."""
+    wins = [w for w in root if w.get("package") != "com.android.systemui"] or list(root)
+    win = min(wins, key=lambda w: area(parse_bounds(w.get("bounds", "")))) if len(wins) > 1 else wins[0]
+    full = area(parse_bounds(win.get("bounds", ""))) * 0.95
+
+    def covers(n):
+        return area(parse_bounds(n.get("bounds", ""))) >= full
+
+    scrim = None
+    for parent in win.iter("node"):
+        kids = list(parent)
+        for i, k in enumerate(kids):
+            if i and len(k) and k.get("clickable") == "true" and covers(k) and any(covers(e) for e in kids[:i]):
+                scrim = k   # document order, so the last one is the topmost
+    return scrim
+
+
+def digest(xml, top=False):
+    """([(tappable, label, (cx, cy))], overlay_found) in document order. A tappable container takes the labels of
+    everything inside it (a list row reads "Name / last message / time"); plain text is listed once, without a number.
+    top=True keeps only the topmost overlay (see overlay_scope), or the whole screen when there is none."""
     root = ET.fromstring(xml)
+    scope = overlay_scope(root) if top else None
     nodes = list(root.iter("node"))
     # the status bar and nav buttons are never what the caller wants, unless nothing else is on screen
     skip = "com.android.systemui" if any(n.get("package") != "com.android.systemui" for n in nodes) else None
@@ -126,35 +155,51 @@ def digest(xml):
         for c in n:
             walk(c)
 
-    walk(root)
-    return out
+    for start in (list(scope) if scope is not None else [root]):
+        walk(start)
+    return out, scope is not None
 
 
-def render(items, fg):
-    lines, n = [f"fg {fg}"], 0
-    for tappable, label, _ in items[:MAX_LINES]:
+def render(items, fg, find=None, note=""):
+    """The screen as text. Tappable lines are numbered over the whole kept list, so `--find` shows the same
+    numbers `tap` uses; find keeps only the lines whose label matches the regex."""
+    lines, n = [], 0
+    for tappable, label, _ in items[:STATE_LINES]:
         if tappable:
             n += 1
-            lines.append(f"{n} {label}")
+            lines.append((f"{n} {label}", label))
         else:
-            lines.append(f"  {label}")
-    if len(items) > MAX_LINES:
-        lines.append(f"  +{len(items) - MAX_LINES} more")
-    return "\n".join(lines)
+            lines.append((f"  {label}", label))
+    head = f"fg {fg}{note}"
+    if find:
+        try:
+            rx = re.compile(find, re.I)
+        except re.error as e:
+            raise SystemExit(f"bad --find regex: {e}")
+        hits = [t for t, l in lines if rx.search(l)]
+        return "\n".join([head, *hits, f"  ({len(hits)} of {len(lines)} lines match)"])
+    out = [head, *[t for t, _ in lines[:MAX_LINES]]]
+    if len(lines) > MAX_LINES:
+        out.append(f"  +{len(lines) - MAX_LINES} more")
+    return "\n".join(out)
 
 
-def snapshot(state, quiet_if_same):
+def snapshot(state, quiet_if_same, find=None, top=False):
+    """Read the screen, keep it in the state for `tap`, and return the text to print. --top keeps only the topmost
+    overlay (the numbers then refer to it); --find only filters what is printed, the numbers stay the screen's own."""
     xml = hierarchy()
-    items = digest(xml)
-    taps = [i for i in items[:MAX_LINES] if i[0]]
-    text = render(items, foreground())
+    items, overlay = digest(xml, top)
+    taps = [i for i in items[:STATE_LINES] if i[0]]
+    note = (" [top layer]" if overlay else " [no overlay found: whole screen]") if top else ""
+    fg = foreground()
+    text = render(items, fg, note=note)
     sig = hashlib.md5(text.encode()).hexdigest()
     # a signature from an old session means the caller has not seen that screen, so print it
     same = quiet_if_same and state.get("sig") == sig and time.time() - state.get("sig_at", 0) < 300
-    free = [{"label": l, "xy": xy} for t, l, xy in items[:MAX_LINES] if not t and xy]
+    free = [{"label": l, "xy": xy} for t, l, xy in items[:STATE_LINES] if not t and xy]
     state.update(sig=sig, sig_at=time.time(), taps=[{"label": l, "xy": xy} for _, l, xy in taps], free=free)
     save_state(state)
-    return "screen unchanged" if same else text
+    return "screen unchanged" if same else (render(items, fg, find, note) if find else text)
 
 
 def refresh(state):
@@ -232,13 +277,13 @@ def finish(a, state, said):
         print(f"{said}, ok")
         return
     print(said)
-    print(snapshot(state, True))
+    print(snapshot(state, True, a.find, a.top))
     state["stale"] = False
     save_state(state)
 
 
 def cmd_screen(a, state):
-    print(snapshot(state, False))
+    print(snapshot(state, False, a.find, a.top))
     state["stale"] = False
     save_state(state)
 
@@ -294,7 +339,7 @@ def cmd_do(a, state):
         except SystemExit as e:
             print(f"step {n} '{step}' failed after {done} done: {e}")
             time.sleep(a.wait)
-            print(snapshot(state, False))
+            print(snapshot(state, False, a.find, a.top))
             state["stale"] = False
             save_state(state)
             return 1
@@ -306,7 +351,7 @@ def cmd_do(a, state):
         print(f"{done} steps ok")
         return
     print(f"{done} steps ok")
-    print(snapshot(state, False))
+    print(snapshot(state, False, a.find, a.top))
     state["stale"] = False
     save_state(state)
 
@@ -352,7 +397,7 @@ def cmd_flow(a, state):
     state["stale"] = True
     save_state(state)
     if not a.quiet:
-        print(snapshot(state, False))
+        print(snapshot(state, False, a.find, a.top))
         state["stale"] = False
         save_state(state)
     return 0 if r["success"] else 1
@@ -400,9 +445,12 @@ def parser():
     p = argparse.ArgumentParser(prog="steer.py", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    def add(name, fn, wait=1.0):
+    def add(name, fn, wait=1.0, screen=True):
         s = sub.add_parser(name)
         s.set_defaults(fn=fn)
+        if screen:
+            s.add_argument("--find", metavar="REGEX", help="print only the lines whose label matches (numbers stay valid)")
+            s.add_argument("--top", action="store_true", help="only the topmost overlay (menu, sheet); the numbers then refer to it")
         if wait:
             s.add_argument("--wait", type=float, default=wait, help="seconds to let the screen settle")
             s.add_argument("--quiet", action="store_true", help="print one line, not the screen")
@@ -425,11 +473,11 @@ def parser():
     s.add_argument("--retries", type=int, default=1)
     s.add_argument("--allow-clear", action="store_true", help="allow a flow that wipes the app's data")
     s.add_argument("--quiet", action="store_true", help="print one line, not the screen")
-    s = add("see", cmd_see, wait=0)
+    s = add("see", cmd_see, wait=0, screen=False)
     s.add_argument("question")
     s.add_argument("--model", default="gemma4:12b")
-    add("mark", cmd_mark, wait=0)
-    s = add("logs", cmd_logs, wait=0)
+    add("mark", cmd_mark, wait=0, screen=False)
+    s = add("logs", cmd_logs, wait=0, screen=False)
     s.add_argument("pattern")
     s.add_argument("--max", type=int, default=5)
     s.add_argument("--width", type=int, default=160)
