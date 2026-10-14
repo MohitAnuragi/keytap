@@ -513,7 +513,7 @@ def cmd_run(args):
     opts = engine.Options(serial=args.serial, mode=pick(args.mode, "mode", "fast"),
                           wait=pick(args.wait, "wait", 10.0), retries=pick(args.retries, "retries", 0),
                           quiet=True,   # the runner prints one line per test itself
-                          llm=llm_model, llm_scope=args.llm_scope)
+                          llm=llm_model, llm_scope=args.llm_scope, llm_vision=not args.llm_text)
     if not engine.pick_serial(opts):
         return 2
     from keytap.device import actions
@@ -617,6 +617,7 @@ def main():
     p.add_argument("--llm", nargs="?", const=DEFAULT_MODEL, metavar="MODEL",
                    help=f"let the local model help when a step fails and no listed dialog explains it (default model {DEFAULT_MODEL}; "
                         "starts Ollama if needed). A test that passes only with its help is marked helped")
+    p.add_argument("--llm-text", action="store_true", help="do not send screenshots to the model (for a model without vision)")
     p.add_argument("--llm-scope", choices=["dialogs", "navigate"], default="dialogs",
                    help="dialogs: close dialogs with their own buttons. navigate: also back, scrolling and any non-money tap")
     p.add_argument("--skip-needs", metavar="TEST[,TEST]", help='do not add these prerequisite tests first; only for tests in "reuse_ok" (the caller knows their state is still fresh)')

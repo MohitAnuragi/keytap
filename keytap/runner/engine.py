@@ -23,6 +23,7 @@ class Options:
     quiet: bool = False
     llm: str = None          # local model that may help when a step fails (see replayer._steer)
     llm_scope: str = "dialogs"
+    llm_vision: bool = True   # send the screenshot to the model (gemma4 reads images; faster and surer than the text list alone)
 
 
 # ── Choosing a recording and a phone ──────────────────────────────────────────
@@ -136,7 +137,7 @@ def run_once(rec, opts, run_dir, package, health, say):
     rep = ActionReplayer()
     rep.extra_wait_s = opts.wait
     rep.default_retries = opts.retries
-    rep.llm_model, rep.llm_scope, rep.llm_package = opts.llm, opts.llm_scope, package
+    rep.llm_model, rep.llm_scope, rep.llm_package, rep.llm_vision = opts.llm, opts.llm_scope, package, opts.llm_vision
     started = time.time()
     rep.start(rec, opts.mode, opts.serial, on_status, on_done, device_resolution=get_device_size())
     done.wait()

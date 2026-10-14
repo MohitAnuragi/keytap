@@ -37,6 +37,7 @@ Actions:
 - wait: the screen is still loading.
 - done: the goal is reached.
 - give_up: no action here can reach the goal.
+If a screenshot is attached, look at it first: a dialog, sheet or popup covering the app is easy to see there.
 Rules: look at foreground.package first. An error, crash, ANR or permission dialog or screen must be closed before anything else (Close, Wait, OK, Allow). Never tap anything about money. If a step was rejected or changed nothing, do not repeat it: try something different."""
 
 SCHEMA = {"type": "object", "required": ["action", "target", "reason"],
@@ -168,7 +169,18 @@ def execute(action, dev, goal_pkg, clickable, policy, message):
     return ""
 
 
-def run(model, dev, serial, goal, goal_pkg, verify, policy="dialogs", message=None, max_steps=8):
+def screenshot_b64(dev, width=540):
+    """The screen as a small JPEG for a vision model (about 60 KB, 700 prompt tokens)."""
+    import base64
+    import io
+    img = dev.screenshot().convert("RGB")
+    img.thumbnail((width, 1200))
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=70)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def run(model, dev, serial, goal, goal_pkg, verify, policy="dialogs", message=None, max_steps=8, vision=False):
     """Steer toward the goal. Returns {"steps", "model_done", "verified", "rejected", "seconds", "llm_s", "prompt_tokens"}."""
     t0, history, steps, rejected, model_done, llm_s, tokens = time.time(), [], [], 0, False, 0.0, []
     obs = observe(dev, serial)
@@ -176,7 +188,7 @@ def run(model, dev, serial, goal, goal_pkg, verify, policy="dialogs", message=No
         prompt = json.dumps({"goal": goal, "goal_package": goal_pkg, "screen": prompt_view(obs), "recent_steps": history[-4:]})
         t = time.time()
         try:
-            answer, raw = llm.chat(model, SYSTEM, prompt, SCHEMA)
+            answer, raw = llm.chat(model, SYSTEM, prompt, SCHEMA, images=[screenshot_b64(dev)] if vision else None)
         except Exception as e:
             steps.append({"n": n, "error": str(e)[:120]})
             break

@@ -40,6 +40,7 @@ class ActionReplayer:
         self.llm_model = None           # local model that may clear what is in the way of a failed step (set by the engine)
         self.llm_scope = "dialogs"      # dialogs | navigate
         self.llm_package = ""
+        self.llm_vision = True          # send the screenshot to the model too
         self.results = []               # one dict per step run: step, label, status, ms, retries, error
         self._current_step = 0   # 0-indexed; set before _wait_between so overlay reflects waiting step
         self._recording = None   # Recording being replayed; None when idle
@@ -464,7 +465,8 @@ class ActionReplayer:
             if self._on_status:
                 self._on_status(f"[LLM] asking {self.llm_model} ({self.llm_scope}) about step failure: {what}")
             res = navigator.run(self.llm_model, self._u2_dev, self._serial, goal, self.llm_package,
-                                navigator.in_app(self.llm_package), policy=policy, max_steps=self.LLM_STEPS)
+                                navigator.in_app(self.llm_package), policy=policy, max_steps=self.LLM_STEPS,
+                                vision=self.llm_vision)
             did = [f"{s['action']}({s.get('target', '')})" for s in res["steps"]
                    if s.get("action") not in (None, "done", "give_up", "wait") and not s.get("rejected")]
             if self._on_status:

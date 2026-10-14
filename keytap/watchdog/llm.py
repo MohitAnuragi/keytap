@@ -52,14 +52,14 @@ def _post(body, timeout):
         return json.load(r)
 
 
-def chat(model, system, user, schema, timeout=300):
+def chat(model, system, user, schema, timeout=300, images=None):
     """(parsed JSON answer, raw response). The raw response carries Ollama's timing fields.
     The schema goes into the prompt and into Ollama's `format` field; some models answer 501
     "structured output is unavailable", then it is asked again without `format`. Either way the
     answer is checked against the schema's required keys."""
     body = {"model": model, "stream": False, "keep_alive": "30m", "think": False, "options": {"temperature": 0, "num_ctx": NUM_CTX},
             "messages": [{"role": "system", "content": f"{system}\nReply with JSON only, matching this schema: {json.dumps(schema)}"},
-                         {"role": "user", "content": user}]}
+                         {"role": "user", "content": user, **({"images": images} if images else {})}]}
     for attempt in (1, 2):   # without `format` a model sometimes renames a key; ask once more
         try:
             raw = _post({**body, "format": schema}, timeout)
