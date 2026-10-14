@@ -394,8 +394,21 @@ class ActionReplayer:
         last_exc = None
         if dev is not None:
             el, last_exc = self._wait_for_element(dev, sel, timeout_s, recorded_s)
+            center = None
             if el is not None:
-                cx, cy = el.center()
+                try:
+                    center = el.center()
+                except Exception:   # it was on screen a moment ago and went away (a splash or a transition)
+                    if self._on_status:
+                        self._on_status(f"[WARN] '{self._describe(sel)}' went away before the tap, looking again")
+                    el, last_exc = self._wait_for_element(dev, sel, min(timeout_s, 3.0), recorded_s)
+                    if el is not None:
+                        try:
+                            center = el.center()
+                        except Exception:
+                            last_exc = None
+            if center is not None:
+                cx, cy = center
                 if action.expect:
                     self._tap_until_visible(dev, cx, cy, ElementSelector(**action.expect))
                 elif action.retap_if_unchanged:
