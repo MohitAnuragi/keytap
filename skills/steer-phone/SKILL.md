@@ -19,12 +19,20 @@ KEYTAP = the folder that contains `steer.py`: the current folder if `./steer.py`
 ./steer.py key back|home|enter|recents
 ./steer.py swipe up|down|left|right     up = see what is below
 ./steer.py launch <package>
+./steer.py do "tap Chat" "tap Groups" "key back"   several steps in one call, prints the final screen
+./steer.py flow <dir> [--package p] [--param k=v]   replay a keytap flow (login, open a tab) in one call
 ./steer.py see "is a dialog open?"      local vision model answers in 1-2 sentences; the image never reaches you
 ./steer.py mark                         remember "now" in logcat
 ./steer.py logs "regex" [--max 5]       match count plus a few sample lines since the mark
 ```
 
-Every action prints the new screen, or `screen unchanged`. Numbers are only valid for the latest printed screen: after a screen change, read the new numbers, do not reuse old ones.
+Every action prints the new screen, or `screen unchanged`. Add `--quiet` to any action and it prints one line (`ok`) instead; use it for a step whose result you do not need to read. After a quiet action the numbers are stale: tap by label, or run `screen` first. Numbers are only valid for the latest printed screen: after a screen change, read the new numbers, do not reuse old ones.
+
+## Batching and flows
+
+- `do` runs its steps back to back and stops at the first one that fails, then shows the screen. Taps must use a label, not a number (the numbers of later screens are unknown), and labels with money or destructive words (pay, transfer, confirm, delete, remove, leave, block...) are refused: tap those singly after reading the screen.
+- `flow` replays a recording from the suites with keytap's own replayer, for deterministic stretches such as login or "open the Groups tab". It prints one line, `flow <name> ok` or `FAILED at step N`, then the screen unless `--quiet`. Pass `--package <pkg>` when the flow uses `{{package}}`. A flow that wipes the app's data (`clear_data`, as the login flows do) is refused unless you pass `--allow-clear`: ask the user first, because the login is lost. The flow clears logcat when it starts; `mark` and `logs` keep what was seen before.
+- Prefer a flow for anything a suite already does, and steer only the new part.
 
 ## How to work
 

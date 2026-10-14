@@ -11,10 +11,14 @@ Tappable lines carry a number; `tap 5` uses the numbers of the last snapshot, `t
   steer.py key back|home|enter|recents   press a key
   steer.py swipe up|down|left|right      up = finger moves up = see what is below
   steer.py launch <package>
+  steer.py do "tap Chat" "tap Groups" "key back"   several steps in one call (labels only, no money words)
+  steer.py flow <dir> [--param k=v] [--package p]   replay a keytap flow in one call (wipes need --allow-clear)
   steer.py see "is a dialog open?"       ask the local vision model, the picture never reaches the caller
   steer.py mark                          remember "now" in logcat
   steer.py logs "regex" [--max 5]        count and sample logcat lines since the mark (clickstream checks)
 
+Every action takes --quiet: print one line instead of the screen. Numbers are then stale until the next `screen`;
+tapping by label still works, it reads the screen first.
 Set ANDROID_SERIAL to pick a phone when several are attached.
 """
 
@@ -33,6 +37,7 @@ from keytap.core.paths import DATA_DIR
 from keytap.core.utils import parse_bounds
 
 STATE = DATA_DIR / "steer" / "state.json"
+SAVED_LOG = DATA_DIR / "steer" / "saved_log.txt"
 MAX_LABEL = 50
 MAX_LINES = 45
 KEYS = {"back": 4, "home": 3, "enter": 66, "recents": 187, "delete": 67, "tab": 61}
@@ -70,8 +75,14 @@ def hierarchy():
 
 
 def foreground():
-    m = FOCUS_RE.search(adb("shell", "dumpsys window | grep mCurrentFocus"))
-    return f"{m.group(1)}/{m.group(2)}" if m else "unknown"
+    # mCurrentFocus can list two displays (the first may be another app on a secondary display), so ask for the
+    # one resumed activity; fall back to the last focus line when nothing is resumed (a notification shade)
+    m = FOCUS_RE.search(adb("shell", "dumpsys activity activities | grep topResumedActivity"))
+    if not m:
+        found = FOCUS_RE.findall(adb("shell", "dumpsys window | grep mCurrentFocus"))
+        m = found[-1] if found else None
+        return f"{m[0]}/{m[1]}" if m else "unknown"
+    return f"{m.group(1)}/{m.group(2)}"
 
 
 def digest(xml):
@@ -146,74 +157,205 @@ def snapshot(state, quiet_if_same):
     return "screen unchanged" if same else text
 
 
-def settle(seconds):
-    time.sleep(seconds)
+def refresh(state):
+    """Read the screen into the state without printing it (the numbers and labels `tap` resolves against)."""
+    snapshot(state, False)
+    state["stale"] = False
+    save_state(state)
 
 
-def cmd_screen(a, state):
-    print(snapshot(state, False))
-
-
-def cmd_tap(a, state):
-    taps = state.get("taps")
-    if taps is None:
-        raise SystemExit("no snapshot yet: run `screen` first")
-    target = a.target
+def act_tap(target, nth, state):
+    """Tap by number or label; returns what was tapped. Raises SystemExit with the reason when it cannot."""
     if target.isdigit():
+        if state.get("stale") or state.get("taps") is None:
+            raise SystemExit("the numbers are out of date (quiet action or no snapshot): run `screen`, or tap by label")
         i = int(target) - 1
+        taps = state["taps"]
         if not 0 <= i < len(taps):
             raise SystemExit(f"no element {target}, screen has {len(taps)} tappable")
         hit = taps[i]
     else:
+        if state.get("stale") or state.get("taps") is None:
+            refresh(state)   # a label is looked up on the screen as it is now, not as it was before a quiet action
         # numbered tappables first, then plain visible text (many rows are not marked clickable but take a tap)
-        hits = [t for t in taps + state.get("free", []) if target.lower() in t["label"].lower()]
+        hits = [t for t in state["taps"] + state.get("free", []) if target.lower() in t["label"].lower()]
         if not hits:
             raise SystemExit(f"no label on screen contains '{target}'")
-        if a.nth > len(hits):
+        if nth > len(hits):
             raise SystemExit(f"only {len(hits)} labels contain '{target}'")
-        hit = hits[a.nth - 1]
+        hit = hits[nth - 1]
     adb("shell", "input", "tap", str(hit["xy"][0]), str(hit["xy"][1]))
-    print(f"tapped {hit['label'][:40]}")
-    settle(a.wait)
-    print(snapshot(state, True))
+    return f"tapped {hit['label'][:40]}"
 
 
-def cmd_type(a, state):
-    adb("shell", f"input text {shlex.quote(a.text.replace(' ', '%s'))}")
-    settle(a.wait)
-    print(snapshot(state, True))
+def act_type(text):
+    adb("shell", f"input text {shlex.quote(text.replace(' ', '%s'))}")
+    return f"typed {len(text)} chars"
 
 
-def cmd_key(a, state):
-    code = KEYS.get(a.key) or (int(a.key) if a.key.isdigit() else None)
+def act_key(key):
+    code = KEYS.get(key) or (int(key) if key.isdigit() else None)
     if code is None:
         raise SystemExit(f"unknown key, use one of {', '.join(KEYS)} or a keycode number")
     adb("shell", "input", "keyevent", str(code))
-    settle(a.wait)
-    print(snapshot(state, True))
+    return f"key {key}"
 
 
-def cmd_swipe(a, state):
+def act_swipe(direction):
     w, h = map(int, re.search(r"(\d+)x(\d+)", adb("shell", "wm", "size")).groups())
     cx, cy = w // 2, h // 2
-    dx, dy = {"up": (0, -h * 0.3), "down": (0, h * 0.3), "left": (-w * 0.3, 0), "right": (w * 0.3, 0)}[a.direction]
+    dx, dy = {"up": (0, -h * 0.3), "down": (0, h * 0.3), "left": (-w * 0.3, 0), "right": (w * 0.3, 0)}[direction]
     adb("shell", "input", "swipe", str(cx), str(cy), str(int(cx + dx)), str(int(cy + dy)), "300")
-    settle(a.wait)
-    print(snapshot(state, True))
+    return f"swiped {direction}"
 
 
-def cmd_launch(a, state):
+def act_launch(package):
     # debug tools such as LeakCanary add a second launcher entry to the package, so monkey would pick one at random
     out = adb("shell", "cmd", "package", "query-activities", "--brief", "-a", "android.intent.action.MAIN",
-              "-c", "android.intent.category.LAUNCHER", a.package)
-    found = re.findall(rf"^\s*({re.escape(a.package)}/\S+)\s*$", out, re.M)
+              "-c", "android.intent.category.LAUNCHER", package)
+    found = re.findall(rf"^\s*({re.escape(package)}/\S+)\s*$", out, re.M)
     comp = next((c for c in found if "leakcanary" not in c.lower()), found[0] if found else None)
     if comp:
         adb("shell", "am", "start", "-a", "android.intent.action.MAIN", "-c", "android.intent.category.LAUNCHER", "-n", comp)
     else:
-        adb("shell", "monkey", "-p", a.package, "-c", "android.intent.category.LAUNCHER", "1")
-    settle(a.wait + 1)
+        adb("shell", "monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1")
+    return f"launched {package}"
+
+
+def finish(a, state, said):
+    """After an action: let the screen settle, then print the screen, or with --quiet only one line.
+    A quiet action leaves the numbers stale, so the next `tap` by number needs a `screen` first."""
+    time.sleep(a.wait)
+    if a.quiet:
+        state["stale"] = True
+        save_state(state)
+        print(f"{said}, ok")
+        return
+    print(said)
     print(snapshot(state, True))
+    state["stale"] = False
+    save_state(state)
+
+
+def cmd_screen(a, state):
+    print(snapshot(state, False))
+    state["stale"] = False
+    save_state(state)
+
+
+def cmd_tap(a, state):
+    finish(a, state, act_tap(a.target, a.nth, state))
+
+
+def cmd_type(a, state):
+    finish(a, state, act_type(a.text))
+
+
+def cmd_key(a, state):
+    finish(a, state, act_key(a.key))
+
+
+def cmd_swipe(a, state):
+    finish(a, state, act_swipe(a.direction))
+
+
+def cmd_launch(a, state):
+    a.wait += 1
+    finish(a, state, act_launch(a.package))
+
+
+def cmd_do(a, state):
+    """Several steps in one call. Taps must name a label (the numbers cannot be known for later steps),
+    and money or destructive labels are refused, because nobody looks at the screen between steps."""
+    from keytap.watchdog.navigator import DENY
+    done = 0
+    for n, step in enumerate(a.steps, 1):
+        try:
+            verb, *rest = shlex.split(step)
+            if verb == "tap" and rest:
+                if rest[0].isdigit():
+                    raise SystemExit("batch taps must use a label, not a number")
+                if DENY.search(rest[0]):
+                    raise SystemExit(f"'{rest[0]}' looks like a money or destructive action: do it as a single `tap`")
+                said = act_tap(rest[0], int(rest[1]) if len(rest) > 1 else 1, state)
+            elif verb == "type" and rest:
+                said = act_type(" ".join(rest))
+            elif verb == "key" and rest:
+                said = act_key(rest[0])
+            elif verb == "swipe" and rest and rest[0] in ("up", "down", "left", "right"):
+                said = act_swipe(rest[0])
+            elif verb == "launch" and rest:
+                said = act_launch(rest[0])
+            elif verb == "wait" and rest:
+                time.sleep(float(rest[0]))
+                said = f"waited {rest[0]}s"
+            else:
+                raise SystemExit("steps are: tap <label> [nth] | type <text> | key <name> | swipe <dir> | launch <pkg> | wait <s>")
+        except SystemExit as e:
+            print(f"step {n} '{step}' failed after {done} done: {e}")
+            time.sleep(a.wait)
+            print(snapshot(state, False))
+            state["stale"] = False
+            save_state(state)
+            return 1
+        done += 1
+        time.sleep(a.wait)
+        state["stale"] = True   # the next label is looked up on the new screen
+    save_state(state)
+    if a.quiet:
+        print(f"{done} steps ok")
+        return
+    print(f"{done} steps ok")
+    print(snapshot(state, False))
+    state["stale"] = False
+    save_state(state)
+
+
+def cmd_flow(a, state):
+    """Replay a keytap flow (a folder with actions.json) with keytap's own replayer: one call for what
+    would otherwise be many steered steps. Refuses a flow that wipes app data unless --allow-clear."""
+    import os
+
+    from keytap.runner import engine, expand
+    path = os.path.abspath(a.flow)
+    root = expand.find_root(path)
+    params = dict(p.split("=", 1) for p in a.param)
+    if a.package:
+        params["package"] = a.package
+    try:
+        rec = expand.load_recording(path, root=root, params=params)[0]
+    except expand.LoadError as e:
+        raise SystemExit(f"cannot load the flow: {e}")
+    wipes = [i for i, x in enumerate(rec.actions, 1) if x.type == "clear_data"]
+    if wipes and not a.allow_clear:
+        raise SystemExit(f"this flow wipes the app's data (clear_data at step {wipes[0]}): the login is lost. Run again with --allow-clear if that is intended")
+    opts = engine.Options(quiet=True, retries=a.retries, wait=10.0)
+    if not engine.pick_serial(opts):
+        raise SystemExit("several phones attached: set ANDROID_SERIAL")
+    if state.get("mark"):   # the run clears logcat first: keep what `mark` has seen so far
+        saved = SAVED_LOG
+        saved.parent.mkdir(parents=True, exist_ok=True)
+        with open(saved, "a") as f:
+            f.write(adb("logcat", "-d", "-v", "time", "-T", state["mark"], timeout=60))
+    out = DATA_DIR / "steer" / "flows" / time.strftime("%Y%m%d_%H%M%S")
+    package = engine.package_of(rec, params.get("package", ""))
+    summary, results = engine.run_recording(lambda: expand.load_recording(path, root=root, params=params)[0],
+                                            opts, str(out), 1, package)
+    r = results[0]
+    name = os.path.basename(path)
+    if r["success"]:
+        print(f"flow {name} ok: {r['total_steps']} steps, {r['duration_s']}s, {r['warnings']} warnings")
+    else:
+        f = r["failure"]
+        print(f"flow {name} FAILED at step {f['step']} '{f['action']}': {f['cause']}: {str(f.get('detail') or f.get('error', ''))[:160]}")
+        print(f"details: {out}/run_01/failure/")
+    state["stale"] = True
+    save_state(state)
+    if not a.quiet:
+        print(snapshot(state, False))
+        state["stale"] = False
+        save_state(state)
+    return 0 if r["success"] else 1
 
 
 def cmd_see(a, state):
@@ -235,6 +377,7 @@ def cmd_see(a, state):
 
 def cmd_mark(a, state):
     state["mark"] = adb("shell", "date", "+%m-%d %H:%M:%S.000").strip()
+    SAVED_LOG.unlink(missing_ok=True)
     save_state(state)
     print(f"marked {state['mark']}")
 
@@ -243,6 +386,8 @@ def cmd_logs(a, state):
     if not state.get("mark"):
         raise SystemExit("no mark yet: run `mark` before the flow")
     out = adb("logcat", "-d", "-v", "time", "-T", state["mark"], timeout=60)
+    if SAVED_LOG.exists():   # lines seen before a `flow` cleared logcat
+        out = SAVED_LOG.read_text() + out
     rx = re.compile(a.pattern)
     hits = [l for l in out.splitlines() if rx.search(l)]
     print(f"{len(hits)} matches since {state['mark']}")
@@ -260,6 +405,7 @@ def parser():
         s.set_defaults(fn=fn)
         if wait:
             s.add_argument("--wait", type=float, default=wait, help="seconds to let the screen settle")
+            s.add_argument("--quiet", action="store_true", help="print one line, not the screen")
         return s
 
     add("screen", cmd_screen, wait=0)
@@ -270,6 +416,15 @@ def parser():
     add("key", cmd_key).add_argument("key")
     add("swipe", cmd_swipe).add_argument("direction", choices=["up", "down", "left", "right"])
     add("launch", cmd_launch).add_argument("package")
+    s = add("do", cmd_do)
+    s.add_argument("steps", nargs="+", help='e.g. "tap Chat" "tap Groups" "key back"')
+    s = add("flow", cmd_flow, wait=0)
+    s.add_argument("flow", help="folder with actions.json")
+    s.add_argument("--param", action="append", default=[], metavar="K=V")
+    s.add_argument("--package", default="", help="fills {{package}}")
+    s.add_argument("--retries", type=int, default=1)
+    s.add_argument("--allow-clear", action="store_true", help="allow a flow that wipes the app's data")
+    s.add_argument("--quiet", action="store_true", help="print one line, not the screen")
     s = add("see", cmd_see, wait=0)
     s.add_argument("question")
     s.add_argument("--model", default="gemma4:12b")
@@ -283,8 +438,7 @@ def parser():
 
 def main():
     a = parser().parse_args()
-    a.fn(a, load_state())
-    return 0
+    return a.fn(a, load_state()) or 0
 
 
 if __name__ == "__main__":
