@@ -131,14 +131,6 @@ def digest(xml, top=False):
     def own(n):
         return re.sub(r"\s+", " ", n.get("text") or n.get("content-desc") or "").strip()[:MAX_LABEL]
 
-    rows = [(own(n), parse_bounds(n.get("bounds", ""))) for n in nodes if n.get("package") != skip and own(n)]
-
-    def row_title(b):
-        """The top-most text to the left of a control on the same row: a switch has no text, its title sits beside it."""
-        h = b[3] - b[1]
-        near = [(t, rb) for t, rb in rows if rb and rb[2] <= b[0] + 1 and min(rb[3], b[3]) - max(rb[1], b[1]) >= 0.3 * h]
-        return min(near, key=lambda x: x[1][1])[0] if near else ""
-
     def labels(n):
         if n.get("package") == skip:
             return []
@@ -156,11 +148,14 @@ def digest(xml, top=False):
         if (n.get("clickable") == "true" or is_input) and not inner:
             b = parse_bounds(n.get("bounds", ""))
             label = " / ".join(dict.fromkeys(labels(n))) or (n.get("resource-id") or "").split("/")[-1]
+            if n.get("checkable") == "true":   # a switch or checkbox: the state is in the hierarchy, not in any text
+                if not label and b:   # a bare switch has no text: take the top-most text to its left on the same row
+                    row = [(t, x) for x in nodes if x.get("package") != skip and own(x) and (t := parse_bounds(x.get("bounds", "")))
+                           and t[0] < b[0] and t[2] <= b[0] + 10 and t[1] < b[3] and t[3] > b[1]]
+                    label = own(min(row, key=lambda r: (r[0][1], r[0][0]))[1]) if row else ""
+                label = f"{label} [{'on' if n.get('checked') == 'true' else 'off'}]".strip()
             if is_input:
                 label = f"[input] {label}".strip()
-            if n.get("checkable") == "true" and b:   # a switch or checkbox: show its state, and the title beside it when it has none
-                state_ = "on" if n.get("checked") == "true" else "off"
-                label = f"[{state_}] {label if label and not label.startswith('[') else row_title(b) or label}".strip()
             if b and b[2] > b[0] and b[3] > b[1] and label:
                 out.append((True, label[:MAX_LABEL * 2], ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)))
             return
