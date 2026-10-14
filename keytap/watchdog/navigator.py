@@ -15,7 +15,8 @@ import xml.etree.ElementTree as ET
 
 from keytap.watchdog import llm
 
-ACTIONS = ["tap", "focus_input", "type_message", "back", "home", "open_app", "wait", "done", "give_up"]
+ACTIONS = ["tap", "focus_input", "type_message", "back", "home", "open_app", "wait", "swipe_up", "swipe_down", "done", "give_up"]
+SOCIAL_ONLY = ("swipe_up", "swipe_down")   # scrolling is only for the wide "social" policy, never the dialogs one
 TAP_WORDS = {"allow", "while using the app", "only this time", "don't allow", "deny", "not now", "later",
              "skip", "ok", "got it", "close", "close app", "wait", "dismiss", "no thanks", "cancel"}
 DENY = re.compile(r"pay|transfer|send money|top ?up|bayar|kirim uang|confirm|purchase|buy|checkout|withdraw|cash|"
@@ -31,6 +32,8 @@ Actions:
 - back: press the Back key (closes dialogs, shades, menus, goes up one screen).
 - home: press the Home key.
 - open_app: launch the goal app.
+- swipe_up: scroll the content up, to see what is below (only when the policy allows it).
+- swipe_down: scroll the content down, to see what is above, or pull a sheet down.
 - wait: the screen is still loading.
 - done: the goal is reached.
 - give_up: no action here can reach the goal.
@@ -52,8 +55,42 @@ def observe(dev, serial):
                   for n in ET.fromstring(xml).iter("node") if n.get("class") == "android.widget.EditText"]
     except ET.ParseError:
         inputs = []
-    return {"foreground": {"package": pkg, "activity": activity}, "texts": s["texts"], "clickable": clickable,
-            "input_fields": inputs, "xml": xml}
+    top_texts, top_clickable = _top_layer(xml)
+    return {"foreground": {"package": pkg, "activity": activity}, "texts": top_texts or s["texts"],
+            "clickable": top_clickable or clickable, "input_fields": inputs, "xml": xml}
+
+
+def _top_layer(xml, limit_texts=25, limit_clickable=30):
+    """What the screen shows, topmost first. The dump lists views bottom to top, so a dialog or sheet comes
+    last: reading the first 12 texts sees only the screen underneath it. A text counts as tappable when it or
+    a parent is clickable (a button's label is often a plain text view inside the clickable container)."""
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError:
+        return [], []
+    parent = {c: p for p in root.iter() for c in p}
+
+    def tappable(n):
+        while n is not None:
+            if n.get("clickable") == "true":
+                return True
+            n = parent.get(n)
+        return False
+
+    texts, clickable, seen = [], [], set()
+    for n in reversed(list(root.iter("node"))):
+        label = (n.get("text") or n.get("content-desc") or "").strip()
+        if not label or len(label) > 80 or n.get("package") == "com.android.systemui":
+            continue
+        if label not in texts and len(texts) < limit_texts:
+            texts.append(label)
+        if tappable(n) and (n.get("text"), n.get("content-desc")) not in seen and len(clickable) < limit_clickable:
+            seen.add((n.get("text"), n.get("content-desc")))
+            # label only: find_element tries resource_id first, and buttons often share one generic id,
+            # so including it taps the first such button on the screen, not the one that was named
+            item = {k: v for k, v in (("text", n.get("text")), ("content_desc", n.get("content-desc"))) if v}
+            clickable.append(item)
+    return texts, clickable
 
 
 def prompt_view(obs):
@@ -113,6 +150,12 @@ def execute(action, dev, goal_pkg, clickable, policy, message):
         if not message:
             return "there is no message to type"
         actions.input_text(message)
+    elif kind in SOCIAL_ONLY:
+        if policy != "social":
+            return "scrolling is not allowed here"
+        w, h = dev.window_size()
+        y0, y1 = (0.75, 0.3) if kind == "swipe_up" else (0.3, 0.75)
+        dev.swipe(w // 2, int(h * y0), w // 2, int(h * y1), 0.3)
     elif kind == "back":
         actions.keyevent(4, "BACK")
     elif kind == "home":

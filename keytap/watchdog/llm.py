@@ -9,8 +9,10 @@ import urllib.error
 import urllib.request
 
 URL = "http://localhost:11434/api/chat"
+DEFAULT_MODEL = "gemma4:12b"
 NUM_CTX = 8192   # Ollama's default of 4096 silently cuts a long prompt; an ANR screen alone can be 12k tokens
 MAX_STR = 80
+KEY_ALIASES = {"action": ("type", "act", "command")}   # a key the model renames when it ignores the schema
 CATEGORIES = ["popup_blocking", "wrong_screen", "selector_changed", "slow_loading",
               "app_regression_suspected", "unknown"]
 
@@ -70,6 +72,10 @@ def chat(model, system, user, schema, timeout=300):
         text = raw["message"]["content"]
         try:
             answer, _ = json.JSONDecoder().raw_decode(text[text.find("{"):])   # skips code fences, ignores trailing text
+            for key in schema["required"]:
+                for alt in KEY_ALIASES.get(key, ()):
+                    if key not in answer and alt in answer:
+                        answer[key] = answer.pop(alt)
             missing = [k for k in schema["required"] if k not in answer]
         except ValueError:
             answer, missing = {}, schema["required"]

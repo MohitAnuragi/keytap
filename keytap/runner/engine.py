@@ -21,6 +21,8 @@ class Options:
     wait: float = 10.0      # extra seconds to keep looking for an element after the recorded wait
     retries: int = 0
     quiet: bool = False
+    llm: str = None          # local model that may help when a step fails (see replayer._steer)
+    llm_scope: str = "dialogs"
 
 
 # ── Choosing a recording and a phone ──────────────────────────────────────────
@@ -134,6 +136,7 @@ def run_once(rec, opts, run_dir, package, health, say):
     rep = ActionReplayer()
     rep.extra_wait_s = opts.wait
     rep.default_retries = opts.retries
+    rep.llm_model, rep.llm_scope, rep.llm_package = opts.llm, opts.llm_scope, package
     started = time.time()
     rep.start(rec, opts.mode, opts.serial, on_status, on_done, device_resolution=get_device_size())
     done.wait()
@@ -159,7 +162,8 @@ def run_once(rec, opts, run_dir, package, health, say):
     result = {"recording": rec.name, "serial": opts.serial or "",
               "success": success, "total_steps": len(rec.actions),
               "battery": health["battery"], "warnings": sum(r["status"] == "warn" for r in rep.results) + anr, "anr": anr,
-              "duration_s": round(time.time() - started, 1), "steps": rep.results}
+              "duration_s": round(time.time() - started, 1), "steps": rep.results,
+              "llm_actions": [a for r in rep.results for a in r.get("llm", [])]}
     if not success:
         result["failure"] = capture(os.path.join(run_dir, "failure"), step, label, error,
                                     rep.u2_device, opts.serial, package)

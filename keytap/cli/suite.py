@@ -22,6 +22,7 @@ import time
 import xml.etree.ElementTree as ET
 
 from keytap.runner import engine
+from keytap.watchdog.llm import DEFAULT_MODEL
 
 EPILOG = """suite folder:
   suite.json                 package, login, before_each, tests, defaults
@@ -44,6 +45,12 @@ suite.json:
                                              caller who knows that state is still fresh may skip the prerequisite
                                              (nightly.py does, with run --skip-needs seed_test)
    "defaults": {"wait": 10, "retries": 1}}   same as the replay.py flags
+
+model help (run --llm [MODEL] [--llm-scope dialogs|navigate]):
+  when a step fails and the "blockers" explain nothing, the local model (Ollama, started if needed) looks at
+  the screen and may close what is in the way: dialogs (its own buttons only), or with navigate also back,
+  scrolling and any non-money tap. 2 calls per test, 3 actions each. A test that passes only after the model
+  acted has "helped": true in summary.json and shows as "passed with help" in the dashboard.
 
 login policy, per test (header "login") or suite default:
   once     log in only when the phone is not logged in; the session is kept between tests.
@@ -363,7 +370,7 @@ class Runner:
         pkg, suite = self.suite["package"], self.suite
         result = {"name": test["name"], "status": "fail", "login": "never", "login_ran": False,
                   "duration_s": 0, "runs": 0, "passed": 0, "cause": "", "detail": "", "step": 0,
-                  "action": "", "failure": None, "screenshot": None, "warnings": 0}
+                  "action": "", "failure": None, "screenshot": None, "warnings": 0, "helped": False}
         started = time.time()
         try:
             rec, header = load_recording(test["path"], self.root)
@@ -404,7 +411,8 @@ class Runner:
                 lambda: load_recording(test["path"], self.root)[0], opts, out, repeat=repeat,
                 package=pkg, reset="stop" if before_each == "restart" else None)
             result.update(runs=summary["runs"], passed=summary["passed"],
-                          warnings=sum(r.get("warnings", 0) for r in results))
+                          warnings=sum(r.get("warnings", 0) for r in results),
+                          helped=any(r.get("llm_actions") for r in results))
             result["status"] = ("pass" if summary["failed"] == 0 else "flaky" if summary["passed"] else "fail")
             bad = next((i for i, r in enumerate(results) if not r["success"]), None)
             if bad is not None:
@@ -492,10 +500,20 @@ def cmd_run(args):
         return 2
 
     d = suite["defaults"]
+    llm_model = None
+    if args.llm:
+        from keytap.watchdog import ollama
+        ok, why = ollama.ensure(args.llm, say=lambda m: print(m, flush=True))
+        if ok:
+            llm_model = args.llm
+            print(f"model help on: {llm_model} ({args.llm_scope}). A test that only passes with its help is marked helped.")
+        else:
+            print(f"model help OFF: {why}. The run carries on without it.")
     pick = lambda cli, key, fallback: cli if cli is not None else d.get(key, fallback)
     opts = engine.Options(serial=args.serial, mode=pick(args.mode, "mode", "fast"),
                           wait=pick(args.wait, "wait", 10.0), retries=pick(args.retries, "retries", 0),
-                          quiet=True)   # the runner prints one line per test itself
+                          quiet=True,   # the runner prints one line per test itself
+                          llm=llm_model, llm_scope=args.llm_scope)
     if not engine.pick_serial(opts):
         return 2
     from keytap.device import actions
@@ -596,6 +614,11 @@ def main():
     p.add_argument("names", nargs="*", help="only tests whose name contains one of these")
     p.add_argument("--exact", action="store_true", help="names must equal a test's name, not just be part of it")
     p.add_argument("--tag", help="only tests with this tag")
+    p.add_argument("--llm", nargs="?", const=DEFAULT_MODEL, metavar="MODEL",
+                   help=f"let the local model help when a step fails and no listed dialog explains it (default model {DEFAULT_MODEL}; "
+                        "starts Ollama if needed). A test that passes only with its help is marked helped")
+    p.add_argument("--llm-scope", choices=["dialogs", "navigate"], default="dialogs",
+                   help="dialogs: close dialogs with their own buttons. navigate: also back, scrolling and any non-money tap")
     p.add_argument("--skip-needs", metavar="TEST[,TEST]", help='do not add these prerequisite tests first; only for tests in "reuse_ok" (the caller knows their state is still fresh)')
     p.add_argument("--repeat", type=int, default=1, metavar="N", help="run each test N times (default: 1)")
     p.add_argument("--login", choices=["once", "always", "never"], help="force one login policy for every test")

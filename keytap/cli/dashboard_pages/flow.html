@@ -126,12 +126,13 @@ ul { margin: 6px 0; padding-left: 20px; }
 
 <div class="card">
   <h2>4. Retries happen at three levels</h2>
-  <p class="lead">When the dashboard says "retry", it helps to know which one.</p>
+  <p class="lead">When the dashboard says "retry", it helps to know which one. Before every step retry, the replayer first closes any dialog from the suite's <code>blockers</code> list (one screen read, free), and only then, if model help is on, asks the model.</p>
   <table>
     <thead><tr><th>Level</th><th>What is repeated</th><th>How many times</th><th>What it costs</th></tr></thead>
     <tbody>
       <tr><td><b>Step retry</b></td><td>Only the one failing step</td><td>2 extra tries</td><td>Seconds</td></tr>
       <tr><td><b>Attempt</b></td><td>The whole test, from its first step, after a recovery</td><td>Up to 3 attempts in total</td><td>The whole test again (up to minutes)</td></tr>
+      <tr><td><b>Model help</b></td><td>Before a step retry, if no known dialog is in the way and model help is on: the local model looks at the screen and may close what is covering the app</td><td>At most 2 calls per test, 3 actions each</td><td>10 to 40 seconds per call. A test that passes only after this is shown as "Passed with help"</td></tr>
       <tr><td><b>Setup again</b></td><td>The setup test that creates data (it logs in, creates groups, logs in again)</td><td>On every later attempt of a test that needs it</td><td>About 4 to 5 minutes and 3 new groups</td></tr>
     </tbody>
   </table>

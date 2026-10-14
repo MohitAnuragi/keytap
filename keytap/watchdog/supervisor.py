@@ -11,7 +11,8 @@ nightly.json:
    "max_infra": 3,                     phone problems in a row before the night is aborted
    "test_timeout_min": 30,
    "allow_steps": [],                  clear_data, permission, dev_option: skipped unless listed here
-   "model": null}                      Ollama model for failure triage and crash summaries, e.g. "gemma4:12b"
+   "model": null,                      Ollama model for failure triage and crash summaries, e.g. "gemma4:12b"
+   "steer": null}                      "dialogs" or "navigate": also let that model help inside each test when a step fails
 
 Results: data/nightly/<time>/{report.md, results.json, audit.jsonl, <suite>/<test>/attempt_NN/}.
 """
@@ -29,7 +30,7 @@ from keytap.runner import engine
 from keytap.watchdog import llm
 
 DEFAULTS = {"suites": [], "serial": None, "max_hours": 7, "min_battery": 20, "max_attempts": 3,
-            "max_infra": 3, "test_timeout_min": 30, "allow_steps": [], "model": None}
+            "max_infra": 3, "test_timeout_min": 30, "allow_steps": [], "model": None, "steer": None}
 UNSAFE_STEPS = ("clear_data", "permission", "dev_option")   # change the phone or wipe the account
 INFRA = engine.INFRA_CAUSES + ("runner_error",)
 
@@ -102,6 +103,8 @@ def run_test(suite_dir, name, out, cfg, skip=()):
     """One run of one test through suite.py. Returns the test's entry from its summary.json.
     skip: prerequisite tests suite.py must not add first (see reusable_needs)."""
     cmd = [sys.executable, "suite.py", "run", suite_dir, name, "--exact", "--repeat", "1", "--quiet", "--out", out]
+    if cfg.get("model") and cfg.get("steer"):
+        cmd += ["--llm", cfg["model"], "--llm-scope", cfg["steer"]]
     if skip:
         cmd += ["--skip-needs", ",".join(skip)]
     if cfg["serial"]:
@@ -168,6 +171,12 @@ def run_night(cfg, dry_run=False):
         return 2
     config.ARGS.serial = opts.serial
     cfg = {**cfg, "serial": opts.serial}
+    if cfg["model"]:   # make sure Ollama runs and the model is loaded; a night without it still works
+        from keytap.watchdog import ollama
+        ok, why = ollama.ensure(cfg["model"], say=lambda m: audit("ollama", msg=m))
+        if not ok:
+            audit("llm_error", what="ollama", error=why)
+            cfg = {**cfg, "model": None}
     actions.set_sync(True)
     started = time.time()
     deadline = started + cfg["max_hours"] * 3600

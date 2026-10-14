@@ -132,7 +132,7 @@ def parse_log(path):
         elif ln.startswith("[RETAP"):
             s["retaps"] += 1
             s["notes"].append(ln)
-        elif ln.startswith(("[WARN]", "[RETYPE", "[SWEEP]")):
+        elif ln.startswith(("[WARN]", "[RETYPE", "[SWEEP]", "[LLM]")):
             s["notes"].append(ln)
     return steps, lines[-40:]
 
@@ -146,7 +146,7 @@ def read_run(run_dir):
         fails = j.get("failure") or {}
         d.update(state="pass" if j.get("success") else "fail", total=j.get("total_steps", 0),
                  step=j.get("total_steps", 0), duration=j.get("duration_s"), warnings=j.get("warnings", 0),
-                 anr=bool(j.get("anr")), failure={k: fails.get(k) for k in ("step", "action", "cause", "detail")} if fails else None,
+                 anr=bool(j.get("anr")), helped=bool(j.get("llm_actions")), llm_actions=j.get("llm_actions", []), failure={k: fails.get(k) for k in ("step", "action", "cause", "detail")} if fails else None,
                  create_groups=sum(1 for s in j.get("steps", []) if "Create group" in s["label"] and s["status"] != "skip"),
                  retried=sum(1 for s in j.get("steps", []) if s.get("retries")))
         shot = run_dir / "failure" / "screenshot.png"
@@ -158,7 +158,8 @@ def read_run(run_dir):
     d.update(state="running" if live else "interrupted", total=cur["total"] if cur else 0, step=cur["n"] if cur else 0,
              current=cur, tail=tail, duration=round(time.time() - d["started"]) if live else None,
              create_groups=sum(1 for s in steps if "Create group" in s["label"] and not s["skipped"]),
-             retried=sum(1 for s in steps if s["retries"]), warnings=0, anr=False, failure=None, screenshot=None)
+             retried=sum(1 for s in steps if s["retries"]), warnings=0, anr=False, helped=False, llm_actions=[],
+             failure=None, screenshot=None)
     return d
 
 
@@ -238,7 +239,8 @@ def read_night(night_id):
                 others_failed = any(r["state"] == "fail" for r in runs if r is not own)
                 astatus = ev["status"] if ev else "running"
                 if own and ev:   # the test's own run is the truth, whatever the supervisor recorded
-                    astatus = "fail" if own["state"] == "fail" else "warn" if others_failed else "pass"
+                    astatus = ("fail" if own["state"] == "fail" else "warn" if others_failed
+                               else "helped" if own.get("helped") else "pass")
                 attempts.append({"n": n, "status": astatus, "supervisor_status": ev["status"] if ev else None,
                                  "cause": (ev or {}).get("cause", ""),
                                  "detail": (ev or {}).get("detail", ""), "step": (ev or {}).get("step"),
@@ -255,8 +257,8 @@ def read_night(night_id):
                 last = attempts[-1]
                 if last["status"] == "running":
                     status = "running" if alive else "stopped"
-                elif last["status"] in ("pass", "warn"):
-                    status = last["status"] if last["status"] == "warn" else "recovered" if len(attempts) > 1 else "pass"
+                elif last["status"] in ("pass", "warn", "helped"):
+                    status = last["status"] if last["status"] in ("warn", "helped") else "recovered" if len(attempts) > 1 else "pass"
                 elif i == current_idx and alive and len(attempts) < MAX_ATTEMPTS and not ended:
                     status = "between_attempts"
                 else:
@@ -354,7 +356,13 @@ def launch(req):
         if not isinstance(repeat, int) or not 1 <= repeat <= 10:
             raise ValueError("Repeat must be a number from 1 to 10.")
         cmd = ["bash", "suites/gojek_common/run_suite.sh", suite["name"], *names] + (["--exact"] if names else []) + ["--repeat", str(repeat)]
-        what = f"{suite['name']}: {', '.join(names) if names else 'all tests'}" + (f" x{repeat}" if repeat > 1 else "")
+        llm = req.get("llm")
+        if llm not in (None, "", "dialogs", "navigate"):
+            raise ValueError("Unknown model help setting.")
+        if llm:
+            cmd += ["--llm", "--llm-scope", llm]
+        what = (f"{suite['name']}: {', '.join(names) if names else 'all tests'}" + (f" x{repeat}" if repeat > 1 else "")
+                + (f" (model help: {llm})" if llm else ""))
     else:
         raise ValueError("Nothing to start.")
     logdir = DATA_DIR / "dashboard"
@@ -436,7 +444,8 @@ def steps_of(run_dir):
     j = _json(run_dir / "result.json")
     if j:
         steps = [{"n": s["step"], "label": s["label"], "status": s["status"], "ms": s["ms"], "retries": s.get("retries", 0),
-                  "origin": (s.get("origin") or "").split(" <- ")[0], "error": s.get("error"), "swept": s.get("swept")} for s in j["steps"]]
+                  "origin": (s.get("origin") or "").split(" <- ")[0], "error": s.get("error"), "swept": s.get("swept"),
+                  "llm": s.get("llm")} for s in j["steps"]]
         return {"done": True, "steps": steps, "failure": j.get("failure"), "anr": bool(j.get("anr")), "tail": []}
     steps, tail = parse_log(run_dir / "replay.log")
     out = []

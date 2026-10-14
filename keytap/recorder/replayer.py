@@ -37,6 +37,9 @@ class ActionReplayer:
         self.extra_wait_s = 10.0        # keep looking this long after the recorded wait
         self._recorded_wait_s = 0.0     # wait still owed for the current step (its gap in the recording)
         self.default_retries = 0        # extra attempts when a step has no retries
+        self.llm_model = None           # local model that may clear what is in the way of a failed step (set by the engine)
+        self.llm_scope = "dialogs"      # dialogs | navigate
+        self.llm_package = ""
         self.results = []               # one dict per step run: step, label, status, ms, retries, error
         self._current_step = 0   # 0-indexed; set before _wait_between so overlay reflects waiting step
         self._recording = None   # Recording being replayed; None when idle
@@ -112,6 +115,7 @@ class ActionReplayer:
         self._serial = serial
         self._skip_left = 0
         self._blockers = list(getattr(recording, "blockers", None) or [])
+        self._llm_uses = 0
         actions.set_sync(True)   # each step finishes before the next starts
         total = len(recording.actions)
 
@@ -164,7 +168,7 @@ class ActionReplayer:
             retries = action.retries if action.retries is not None else self.default_retries
             started = time.time()
             attempt = 0
-            swept = []
+            swept, helped = [], []
             if not skipped and ok:
                 ok, error = self._execute_safe(action, serial)
                 while (not ok and attempt < retries and not self._stop_event.is_set()
@@ -172,6 +176,8 @@ class ActionReplayer:
                     attempt += 1
                     on_status(f"[RETRY {attempt}/{retries}] step {i + 1}: {error}")
                     swept += self._clear_blockers()   # a dialog may be what made the step fail
+                    if not swept and self.llm_model:
+                        helped += self._steer(action, error)   # an unlisted dialog or the wrong screen: ask the model
                     time.sleep(self.RETRY_PAUSE_S)
                     ok, error = self._execute_safe(action, serial)
             warn, self._warn = self._warn, ""
@@ -185,6 +191,8 @@ class ActionReplayer:
                 entry["origin"] = action.origin
             if swept:
                 entry["swept"] = swept
+            if helped:
+                entry["llm"] = helped
             self.results.append(entry)
             if warn:
                 on_status(f"[WARN] step {i + 1}: {warn}")
@@ -431,6 +439,42 @@ class ActionReplayer:
             return f"unreadable ({type(e).__name__})"
 
     MAX_SWEEPS = 6        # dialogs closed in a row before a sweep gives up
+    LLM_USES_PER_TEST = 2  # model calls per run, so a bad run cannot burn minutes
+    LLM_STEPS = 3          # actions the model may take per call
+
+    def _steer(self, action, error):
+        """A step failed and no listed dialog explains it: the local model looks at the screen and may close
+        what is in the way. Returns what it did, e.g. ["tap(Not now)"]. Never raises."""
+        if self._llm_uses >= self.LLM_USES_PER_TEST or self._u2_dev is None:
+            return []
+        self._llm_uses += 1
+        try:
+            from keytap.watchdog import navigator
+            what = f"{action_label(action)} failed: {str(error)[:160]}"
+            if self.llm_scope == "navigate":
+                goal = (f"A test step ({what}). The app may be covered by something or on the wrong screen. Get it back to a "
+                        f"normal app screen where the step can work: close dialogs and sheets, press back, or scroll. "
+                        f"Never tap anything about money. If the screen already looks normal, say done.")
+                policy = "social"
+            else:
+                goal = (f"A test step ({what}). Something unexpected may be covering the app: a dialog, sheet, popup or banner. "
+                        f"Close it with its own button (Close, Not now, Skip, OK, Got it, Wait). Do nothing else. "
+                        f"If nothing is covering the app, say done.")
+                policy = "dialogs"
+            if self._on_status:
+                self._on_status(f"[LLM] asking {self.llm_model} ({self.llm_scope}) about step failure: {what}")
+            res = navigator.run(self.llm_model, self._u2_dev, self._serial, goal, self.llm_package,
+                                navigator.in_app(self.llm_package), policy=policy, max_steps=self.LLM_STEPS)
+            did = [f"{s['action']}({s.get('target', '')})" for s in res["steps"]
+                   if s.get("action") not in (None, "done", "give_up", "wait") and not s.get("rejected")]
+            if self._on_status:
+                self._on_status(f"[LLM] {res['seconds']}s, did: {', '.join(did) or 'nothing'}"
+                                + (f" (screen ok: {res['verified']})" if res.get("verified") is not None else ""))
+            return did
+        except Exception as e:
+            if self._on_status:
+                self._on_status(f"[LLM] could not help ({type(e).__name__}: {str(e)[:100]})")
+            return []
 
     @staticmethod
     def _blocker_matches(node, b):

@@ -56,7 +56,7 @@ input[type=number] { width: 70px; background: var(--card); color: var(--ink); bo
 .pill { display: inline-block; padding: 2px 10px; border-radius: 99px; font-size: 13px; font-weight: 600; white-space: nowrap; }
 .pill.pass, .pill.recovered { background: var(--pass-bg); color: var(--pass); }
 .pill.fail { background: var(--fail-bg); color: var(--fail); }
-.pill.warn, .pill.between_attempts, .pill.stopped { background: var(--warn-bg); color: var(--warn); }
+.pill.warn, .pill.helped, .pill.between_attempts, .pill.stopped { background: var(--warn-bg); color: var(--warn); }
 .pill.running { background: var(--run-bg); color: var(--run); }
 .pill.pending, .pill.not_run, .pill.skipped_policy, .pill.interrupted { background: var(--idle-bg); color: var(--idle); }
 .bar { height: 10px; background: var(--idle-bg); border-radius: 99px; overflow: hidden; margin: 8px 0; }
@@ -78,7 +78,7 @@ tr.test:hover { background: var(--bg); }
 .desc { color: var(--muted); font-size: 13px; }
 .att { display: inline-block; margin: 0 4px 2px 0; padding: 0 8px; border-radius: 6px; font-size: 12px; font-weight: 600; }
 .att.pass { background: var(--pass-bg); color: var(--pass); } .att.fail { background: var(--fail-bg); color: var(--fail); }
-.att.warn { background: var(--warn-bg); color: var(--warn); } .att.running { background: var(--run-bg); color: var(--run); }
+.att.warn, .att.helped { background: var(--warn-bg); color: var(--warn); } .att.running { background: var(--run-bg); color: var(--run); }
 .detail { background: var(--bg); }
 .detail td { padding: 12px 14px; }
 .attempt { border: 1px solid var(--line); background: var(--card); border-radius: 10px; padding: 10px 12px; margin: 8px 0; }
@@ -132,6 +132,14 @@ label.tog { font-size: 13px; color: var(--muted); }
       <div class="tests" id="testBox"></div>
       <div class="muted" id="needsNote"></div>
       <label>Repeat each test: <input type="number" id="repeat" min="1" max="10" value="1"> time(s)</label>
+      <label>Local model help:
+        <select id="llmSel">
+          <option value="">Off</option>
+          <option value="dialogs">Close unexpected dialogs when a step fails</option>
+          <option value="navigate">Wider steering: also back, scrolling, any non-money tap</option>
+        </select>
+      </label>
+      <div class="muted">Starts Ollama if needed. Each help costs 10 to 40 seconds and only happens when a step has failed and no listed dialog explains it. A test that only passes with the model's help is shown as "Passed with help".</div>
     </div>
     <div id="nightpart" style="display:none;gap:10px">
       <label>Config: <select id="cfgSel"></select></label>
@@ -176,7 +184,7 @@ const CAUSE = {
   load_error: "The test file could not be loaded",
 };
 const STATUS = {
-  pass: "Passed", fail: "Failed", warn: "Passed, but its seed failed", recovered: "Passed after a retry",
+  pass: "Passed", fail: "Failed", warn: "Passed, but its seed failed", helped: "Passed with help from the model", recovered: "Passed after a retry",
   running: "Running", between_attempts: "Waiting to retry", pending: "Waiting", stopped: "Stopped midway",
   not_run: "Not run", skipped_policy: "Skipped (unsafe step)", interrupted: "Interrupted",
 };
@@ -237,7 +245,7 @@ function renderHistory(ov, key) {
 
 function renderBanner(v, ov) {
   const total = v.suites.reduce((n, s) => n + s.tests.length, 0);
-  const done = v.suites.reduce((n, s) => n + s.tests.filter((t) => ["pass", "fail", "warn", "recovered", "skipped_policy"].includes(t.status)).length, 0);
+  const done = v.suites.reduce((n, s) => n + s.tests.filter((t) => ["pass", "fail", "warn", "helped", "recovered", "skipped_policy"].includes(t.status)).length, 0);
   const procs = ov.processes.map((p) => p.kind + " (running " + p.elapsed + ")").join(", ");
   let cls = "", big = "", sub = "";
   const name = v.kind === "night" ? "Nightly run " + v.id : "Suite run " + v.id;
@@ -257,7 +265,7 @@ function renderStats(v) {
   const c = v.counts, g = (k) => c[k] || 0;
   const reused = v.suites.reduce((n, s) => n + s.tests.filter((t) => t.reused && t.reused.length).length, 0);
   const cells = [
-    ["Passed", g("pass") + g("recovered")], ["Failed", g("fail")], ["Passed with a warning", g("warn")],
+    ["Passed", g("pass") + g("recovered")], ["Failed", g("fail")], ["Passed with a warning", g("warn")], ["Passed with help", g("helped")],
     ["Running", g("running") + g("between_attempts")], ["Waiting", g("pending")], ["Not run / stopped", g("not_run") + g("stopped")],
     ["Groups created", v.groups_created], ["Seed reused", reused],
   ];
@@ -299,6 +307,8 @@ function whatHappened(t) {
   }
   if (t.attempts.length > 1) bits.push(t.attempts.length + " attempts");
   if (t.status === "warn") bits.push("The test itself passed, but the setup it needed failed");
+  const helpedRuns = last ? last.runs.filter((r) => r.helped) : [];
+  if (helpedRuns.length) bits.push("The local model stepped in: " + helpedRuns.map((r) => r.llm_actions.join(", ")).join("; "));
   const mism = (last || {}).supervisor_status && last.supervisor_status !== last.status && last.status !== "running";
   if (mism) bits.push("The nightly's own record says " + esc(last.supervisor_status) + " - the dashboard shows what the test itself did");
   return bits.join(". ") || "";
@@ -356,7 +366,8 @@ async function loadOpenRun() {
       const failed = s.status === "fail", retried = s.retries > 0 && !failed;
       const cls = failed ? "failed" : s.status === "running" ? "running" : retried ? "retried" : s.status === "skip" ? "skip" : "";
       const res = failed ? "Failed" : s.status === "running" ? "Running" + (s.waiting ? " (waiting for it)" : "") : s.status === "skip" ? "Skipped" : s.status === "warn" ? "Warning" : retried ? `Passed after ${s.retries} retr${s.retries > 1 ? "ies" : "y"}` : "Passed";
-      const swept = s.swept && s.swept.length ? `<div class="muted">closed a dialog: ${esc(s.swept.join(", "))}</div>` : "";
+      const swept = (s.swept && s.swept.length ? `<div class="muted">closed a dialog: ${esc(s.swept.join(", "))}</div>` : "")
+        + (s.llm && s.llm.length ? `<div class="muted">the model did: ${esc(s.llm.join(", "))}</div>` : "");
       h += `<tr class="${cls}"><td>${s.n}</td><td class="lbl">${esc(plain(s.label))}${s.error ? `<div class="err">${esc(s.error)}</div>` : ""}</td><td class="hide-sm muted">${esc(s.origin)}</td><td>${s.ms != null ? (s.ms / 1000).toFixed(1) + "s" : ""}</td><td>${res}${swept}</td></tr>`;
     });
     h += `</tbody></table>`;
@@ -445,8 +456,8 @@ async function initRun() {
     } else {
       const picked = checkedTests(), s = suiteObj();
       if (!picked.length) return runMsg("Select at least one test.", "bad");
-      req = { kind: "suite", suite: s.name, tests: picked.length === s.tests.length ? [] : picked, repeat: parseInt($("repeat").value, 10) || 1 };
-      ask = warn + "Start " + (req.tests.length ? picked.length + " selected test(s)" : "all " + picked.length + " tests") + " of " + s.name + (req.repeat > 1 ? ", " + req.repeat + " times each" : "") + "?";
+      req = { kind: "suite", suite: s.name, tests: picked.length === s.tests.length ? [] : picked, repeat: parseInt($("repeat").value, 10) || 1, llm: $("llmSel").value };
+      ask = warn + "Start " + (req.tests.length ? picked.length + " selected test(s)" : "all " + picked.length + " tests") + " of " + s.name + (req.repeat > 1 ? ", " + req.repeat + " times each" : "") + (req.llm ? ", with the local model helping (" + req.llm + ")" : "") + "?";
     }
     if (!confirm(ask)) return;
     try { const r = await post("/api/run", req); runMsg("Started: " + r.what + ". It should show up above within a few seconds.", "good"); refresh(); }
