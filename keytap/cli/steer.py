@@ -6,7 +6,7 @@ one short line each (about 250 tokens), and every action prints the new screen, 
 Tappable lines carry a number; `tap 5` uses the numbers of the last snapshot, `tap "text"` matches a label.
 
   steer.py screen                        what is on screen
-  steer.py tap 5 | tap "Accept" [nth]    tap by number or label, then show the result
+  steer.py tap 5 | tap "Accept" [nth]    tap by number or by label (any visible text), then show the result
   steer.py type "hello"                  type into the focused field
   steer.py key back|home|enter|recents   press a key
   steer.py swipe up|down|left|right      up = finger moves up = see what is below
@@ -98,7 +98,9 @@ def digest(xml):
         if n.get("package") == skip:
             return
         is_input = n.get("class") == "android.widget.EditText"
-        if n.get("clickable") == "true" or is_input:
+        # a clickable that wraps other clickables (a full-screen scrim around a menu) would swallow them: list the inner ones
+        inner = any(d.get("clickable") == "true" or d.get("class") == "android.widget.EditText" for d in n.iter("node") if d is not n)
+        if (n.get("clickable") == "true" or is_input) and not inner:
             b = parse_bounds(n.get("bounds", ""))
             label = " / ".join(dict.fromkeys(labels(n))) or (n.get("resource-id") or "").split("/")[-1]
             if is_input:
@@ -108,7 +110,8 @@ def digest(xml):
             return
         if own(n) and own(n) not in seen:
             seen.add(own(n))
-            out.append((False, own(n), None))
+            nb = parse_bounds(n.get("bounds", ""))
+            out.append((False, own(n), ((nb[0] + nb[2]) // 2, (nb[1] + nb[3]) // 2) if nb else None))
         for c in n:
             walk(c)
 
@@ -137,7 +140,8 @@ def snapshot(state, quiet_if_same):
     sig = hashlib.md5(text.encode()).hexdigest()
     # a signature from an old session means the caller has not seen that screen, so print it
     same = quiet_if_same and state.get("sig") == sig and time.time() - state.get("sig_at", 0) < 300
-    state.update(sig=sig, sig_at=time.time(), taps=[{"label": l, "xy": xy} for _, l, xy in taps])
+    free = [{"label": l, "xy": xy} for t, l, xy in items[:MAX_LINES] if not t and xy]
+    state.update(sig=sig, sig_at=time.time(), taps=[{"label": l, "xy": xy} for _, l, xy in taps], free=free)
     save_state(state)
     return "screen unchanged" if same else text
 
@@ -161,11 +165,12 @@ def cmd_tap(a, state):
             raise SystemExit(f"no element {target}, screen has {len(taps)} tappable")
         hit = taps[i]
     else:
-        hits = [t for t in taps if target.lower() in t["label"].lower()]
+        # numbered tappables first, then plain visible text (many rows are not marked clickable but take a tap)
+        hits = [t for t in taps + state.get("free", []) if target.lower() in t["label"].lower()]
         if not hits:
-            raise SystemExit(f"no tappable label contains '{target}'")
+            raise SystemExit(f"no label on screen contains '{target}'")
         if a.nth > len(hits):
-            raise SystemExit(f"only {len(hits)} tappable labels contain '{target}'")
+            raise SystemExit(f"only {len(hits)} labels contain '{target}'")
         hit = hits[a.nth - 1]
     adb("shell", "input", "tap", str(hit["xy"][0]), str(hit["xy"][1]))
     print(f"tapped {hit['label'][:40]}")
