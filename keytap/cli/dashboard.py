@@ -1,5 +1,7 @@
 """
-Live dashboard for test runs, in the browser. Read-only: it only reads data/nightly, suites/*/.runs and `ps`.
+Live dashboard for test runs, in the browser. It reads data/nightly, suites/*/.runs and `ps`, and can start
+and stop a run (the Run panel): it only ever launches suites/gojek_common/run_suite.sh and run_nightly.sh,
+one run at a time, from a page that holds a random token (so no other website can trigger a run).
 
   ./dashboard.py                 then open http://127.0.0.1:8765
   ./dashboard.py --port 9000
@@ -9,9 +11,12 @@ Pages: /  the dashboard (what is running, every test, every step, retries, failu
 """
 
 import argparse
+import glob
 import json
 import os
 import re
+import secrets
+import signal
 import subprocess
 import sys
 import time
@@ -25,6 +30,8 @@ PAGES = Path(__file__).parent / "dashboard_pages"
 LIVE_S = 120          # a run whose log changed in the last 2 minutes is live
 MAX_ATTEMPTS = 3      # nightly default (the config may differ)
 _cache = {}
+TOKEN = secrets.token_urlsafe(16)   # the page sends it back with every start or stop
+LAUNCH = {}                         # the run this server started last: pid, what, log file, started
 
 
 def _mtime(p):
@@ -306,6 +313,87 @@ def read_suite_run(suite, run_id):
             "now": now, "events": [], "groups_created": groups, "max_attempts": 1}
 
 
+# -- starting and stopping a run -----------------------------------------------------------------
+
+def nightly_configs():
+    found = sorted(glob.glob(str(ROOT / "nightly*.json")) + glob.glob(str(ROOT / "suites" / "*" / "nightly*.json")))
+    return [os.path.relpath(p, ROOT) for p in found]
+
+
+def options():
+    suites = []
+    sd = ROOT / "suites"
+    for s in sorted(sd.iterdir()) if sd.is_dir() else []:
+        if (s / "suite.json").is_file() and s.name != "gojek_common":
+            tests, cfg = suite_tests(s)
+            if tests:
+                suites.append({"name": s.name, "package": cfg.get("package", ""), "needs": cfg.get("needs") or {},
+                               "tests": [{"name": n, "desc": d} for n, d in tests]})
+    return {"token": TOKEN, "suites": suites, "configs": nightly_configs()}
+
+
+def launch(req):
+    """Start one run through the same scripts you would type. Raises ValueError with a plain reason."""
+    mine = LAUNCH.get("proc")
+    # our own launch counts at once: `ps` does not show a process for a moment after it starts
+    if (mine and mine.poll() is None) or any(p["kind"] in ("nightly", "suite", "replay") for p in processes()):
+        raise ValueError("A run is already going on the phone. Stop it first.")
+    opts = options()
+    if req.get("kind") == "nightly":
+        if req.get("config") not in opts["configs"]:
+            raise ValueError("Unknown nightly config.")
+        cmd, what = ["bash", "suites/gojek_common/run_nightly.sh", req["config"]], "nightly " + req["config"]
+    elif req.get("kind") == "suite":
+        suite = next((s for s in opts["suites"] if s["name"] == req.get("suite")), None)
+        if not suite:
+            raise ValueError("Unknown suite.")
+        names = req.get("tests") or []
+        if not isinstance(names, list) or any(n not in {t["name"] for t in suite["tests"]} for n in names):
+            raise ValueError("Unknown test in the selection.")
+        repeat = req.get("repeat", 1)
+        if not isinstance(repeat, int) or not 1 <= repeat <= 10:
+            raise ValueError("Repeat must be a number from 1 to 10.")
+        cmd = ["bash", "suites/gojek_common/run_suite.sh", suite["name"], *names] + (["--exact"] if names else []) + ["--repeat", str(repeat)]
+        what = f"{suite['name']}: {', '.join(names) if names else 'all tests'}" + (f" x{repeat}" if repeat > 1 else "")
+    else:
+        raise ValueError("Nothing to start.")
+    logdir = DATA_DIR / "dashboard"
+    logdir.mkdir(parents=True, exist_ok=True)
+    log = logdir / (time.strftime("%Y%m%d_%H%M%S") + ".log")
+    with open(log, "w") as f:
+        p = subprocess.Popen(cmd, cwd=ROOT, stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+    LAUNCH.clear()
+    LAUNCH.update(pid=p.pid, what=what, log=str(log), started=time.time(), proc=p)
+    return {"pid": p.pid, "what": what}
+
+
+def stop():
+    """SIGTERM to the whole run (its scripts restore the phone's animation settings on the way out)."""
+    procs = [p for p in processes() if p["kind"] in ("nightly", "suite", "replay")]
+    p = LAUNCH.get("proc")
+    if not procs and not (p and p.poll() is None):
+        raise ValueError("Nothing is running.")
+    if p and p.poll() is None:
+        os.killpg(p.pid, signal.SIGTERM)
+        return {"stopped": LAUNCH["what"]}
+    for pr in procs:   # a run started from a terminal: stop just that process
+        os.kill(pr["pid"], signal.SIGTERM)
+    return {"stopped": ", ".join(pr["kind"] for pr in procs)}
+
+
+def launch_info():
+    if not LAUNCH:
+        return None
+    p = LAUNCH["proc"]
+    code = p.poll()
+    tail = []
+    try:
+        tail = Path(LAUNCH["log"]).read_text(errors="replace").splitlines()[-12:]
+    except OSError:
+        pass
+    return {"what": LAUNCH["what"], "pid": LAUNCH["pid"], "started": LAUNCH["started"], "exit": code, "tail": tail}
+
+
 def overview():
     nights, runs = [], []
     nd = DATA_DIR / "nightly"
@@ -339,7 +427,8 @@ def overview():
         default = {"kind": "run", "suite": runs[0]["suite"], "id": runs[0]["id"]}
     else:
         default = None
-    return {"now": time.time(), "processes": procs, "nights": nights, "runs": runs[:25], "default": default}
+    return {"now": time.time(), "processes": procs, "nights": nights, "runs": runs[:25], "default": default,
+            "launch": launch_info()}
 
 
 def steps_of(run_dir):
@@ -372,6 +461,29 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _local_only(self):
+        """Only this machine's own page may start or stop a run (blocks other websites and DNS rebinding)."""
+        host = (self.headers.get("Host") or "").split(":")[0]
+        origin = self.headers.get("Origin")
+        if host not in ("127.0.0.1", "localhost") or (origin and urlparse(origin).hostname not in ("127.0.0.1", "localhost")):
+            raise ValueError("Not allowed from this page.")
+        if not secrets.compare_digest(self.headers.get("X-Dash-Token") or "", TOKEN):
+            raise ValueError("Missing or wrong token. Reload the dashboard.")
+
+    def do_POST(self):
+        u = urlparse(self.path)
+        try:
+            self._local_only()
+            n = int(self.headers.get("Content-Length") or 0)
+            req = json.loads(self.rfile.read(min(n, 20000)) or b"{}")
+            if u.path == "/api/run":
+                return self._send(200, json.dumps(launch(req)))
+            if u.path == "/api/stop":
+                return self._send(200, json.dumps(stop()))
+            return self._send(404, json.dumps({"error": "not found"}))
+        except (ValueError, KeyError, OSError) as e:
+            return self._send(400, json.dumps({"error": str(e)}))
+
     def do_GET(self):
         u = urlparse(self.path)
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
@@ -382,6 +494,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, (PAGES / "flow.html").read_bytes(), "text/html; charset=utf-8")
             if u.path == "/api/overview":
                 return self._send(200, json.dumps(overview()))
+            if u.path == "/api/options":
+                return self._send(200, json.dumps(options()))
             if u.path == "/api/view":
                 if q.get("kind") == "night":
                     return self._send(200, json.dumps(read_night(os.path.basename(q["id"]))))

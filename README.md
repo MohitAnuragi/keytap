@@ -113,7 +113,7 @@ keytap --backend screenrecord   # fallback capture
 | Test (`suites/<x>/tests/`) | A recording with assertions; it passes or fails | You want a check that something works |
 | Suite (`suite.py`, `suite.json`) | A folder of tests and flows plus defaults (retries, login policy, restart between tests) | Running several tests together and getting a pass/fail report |
 | Run (`data/runs/...`) | Output folder of one execution: `result.json`, plus screenshot, hierarchy and logcat on failure | Debugging why something failed |
-| `dashboard.py` | Local web page (http://127.0.0.1:8765) that follows runs live: what is running, every test and step, retries, failures, plus a "how a run works" page. Read-only | You want to see what a nightly or suite run is doing, or why it failed |
+| `dashboard.py` | Local web page (http://127.0.0.1:8765) that follows runs live: what is running, every test and step, retries, failures, plus a "how a run works" page. Its Run panel can start and stop a suite run or a nightly (one at a time, through `run_suite.sh` and `run_nightly.sh`, behind a confirm dialog) | You want to see what a nightly or suite run is doing, or why it failed |
 | `nightly.py` | Unattended overnight loop over the suites in `nightly.json`, with phone and battery checks and a morning report | Running everything while you sleep |
 
 In short: build with the recorder, try a flow with `replay.py`, run a feature's tests with `suite.py run`, run everything unattended with `nightly.py`.

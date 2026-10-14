@@ -40,6 +40,19 @@ select { background: var(--card); color: var(--ink); border: 1px solid var(--lin
 .stat { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 10px 14px; }
 .stat b { display: block; font-size: 24px; line-height: 1.2; }
 .stat span { color: var(--muted); font-size: 13px; }
+details.runpanel summary { cursor: pointer; font-weight: 650; font-size: 16px; }
+.runform { margin-top: 12px; display: grid; gap: 12px; }
+.runform label { display: block; }
+.runform .tests { border: 1px solid var(--line); border-radius: 8px; max-height: 240px; overflow: auto; padding: 4px 10px; background: var(--bg); }
+.runform .tests label { padding: 3px 0; border-top: 1px solid var(--line); }
+.runform .tests label:first-child { border-top: 0; }
+button { font: inherit; border-radius: 8px; border: 1px solid var(--line); padding: 7px 16px; cursor: pointer; background: var(--card); color: var(--ink); font-weight: 600; }
+button.go { background: var(--accent); color: var(--card); border-color: transparent; }
+button.stop { background: var(--fail-bg); color: var(--fail); }
+button:disabled { opacity: .45; cursor: not-allowed; }
+input[type=number] { width: 70px; background: var(--card); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 5px 8px; font: inherit; }
+.msg { min-height: 20px; }
+.msg.bad { color: var(--fail); } .msg.good { color: var(--pass); }
 .pill { display: inline-block; padding: 2px 10px; border-radius: 99px; font-size: 13px; font-weight: 600; white-space: nowrap; }
 .pill.pass, .pill.recovered { background: var(--pass-bg); color: var(--pass); }
 .pill.fail { background: var(--fail-bg); color: var(--fail); }
@@ -105,6 +118,32 @@ label.tog { font-size: 13px; color: var(--muted); }
 </header>
 
 <div id="banner" class="card banner"></div>
+<div id="launchmsg"></div>
+<details class="card runpanel" id="runpanel">
+  <summary>Start or stop a run</summary>
+  <div class="runform">
+    <div>
+      <label><input type="radio" name="mode" value="suite" checked> Run tests of a suite</label>
+      <label><input type="radio" name="mode" value="nightly"> Run a nightly (the unattended run with retries, recovery and a report)</label>
+    </div>
+    <div id="suitepart" style="display:grid;gap:10px">
+      <label>Suite: <select id="suiteSel"></select></label>
+      <div><button type="button" id="allBtn">Select all</button> <button type="button" id="noneBtn">Select none</button></div>
+      <div class="tests" id="testBox"></div>
+      <div class="muted" id="needsNote"></div>
+      <label>Repeat each test: <input type="number" id="repeat" min="1" max="10" value="1"> time(s)</label>
+    </div>
+    <div id="nightpart" style="display:none;gap:10px">
+      <label>Config: <select id="cfgSel"></select></label>
+      <div class="muted">A nightly can take an hour or more, retries a failing test up to 3 times and writes a morning report. Stopping it midway means no report is written.</div>
+    </div>
+    <div>
+      <button type="button" class="go" id="startBtn">Start run</button>
+      <button type="button" class="stop" id="stopBtn" style="display:none">Stop the run</button>
+    </div>
+    <div class="msg" id="runmsg"></div>
+  </div>
+</details>
 <div id="stats" class="stats"></div>
 <div id="now"></div>
 <div id="tests"></div>
@@ -358,13 +397,81 @@ function renderTimeline(v) {
   $("timeline").innerHTML = v.events.map((e) => { const [txt, cls] = narrate(e); return `<div class="ev ${cls}"><time>${esc(e.t)}</time>${esc(txt)}</div>`; }).join("");
 }
 
+// ---- Start / stop panel ----
+const run = { opts: null, busy: false };
+async function post(path, body) {
+  const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Dash-Token": run.opts.token }, body: JSON.stringify(body || {}) });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || "failed");
+  return j;
+}
+function runMsg(t, cls) { const m = $("runmsg"); m.textContent = t; m.className = "msg " + (cls || ""); }
+function suiteObj() { return run.opts.suites.find((s) => s.name === $("suiteSel").value); }
+function checkedTests() { return [...$("testBox").querySelectorAll("input:checked")].map((i) => i.value); }
+function renderTestBox() {
+  const s = suiteObj();
+  $("testBox").innerHTML = s ? s.tests.map((t, i) => `<label><input type="checkbox" value="${esc(t.name)}" checked> ${i + 1}. <b>${esc(t.name)}</b><div class="desc">${esc(t.desc)}</div></label>`).join("") : "";
+  $("testBox").querySelectorAll("input").forEach((i) => i.onchange = updateNeeds);
+  updateNeeds();
+}
+function updateNeeds() {
+  const s = suiteObj(), picked = new Set(checkedTests()), extra = new Set();
+  if (!s) return;
+  const add = (n) => (s.needs[n] || []).forEach((d) => { if (!picked.has(d) && !extra.has(d)) { extra.add(d); add(d); } });
+  picked.forEach(add);
+  $("needsNote").textContent = picked.size === 0 ? "Nothing selected." : (extra.size ? "These will also run first, because the selected tests need them: " + [...extra].join(", ") + "." : "");
+}
+async function initRun() {
+  try { run.opts = await api("/api/options"); } catch (e) { return; }
+  $("suiteSel").innerHTML = run.opts.suites.map((s) => `<option value="${esc(s.name)}">${esc(s.name)} (${esc(s.package)})</option>`).join("");
+  $("cfgSel").innerHTML = run.opts.configs.map((c) => `<option>${esc(c)}</option>`).join("") || "<option value=''>no nightly config found</option>";
+  $("suiteSel").onchange = renderTestBox;
+  $("allBtn").onclick = () => { $("testBox").querySelectorAll("input").forEach((i) => i.checked = true); updateNeeds(); };
+  $("noneBtn").onclick = () => { $("testBox").querySelectorAll("input").forEach((i) => i.checked = false); updateNeeds(); };
+  document.querySelectorAll("input[name=mode]").forEach((r) => r.onchange = () => {
+    const night = document.querySelector("input[name=mode]:checked").value === "nightly";
+    $("suitepart").style.display = night ? "none" : "grid"; $("nightpart").style.display = night ? "grid" : "none";
+  });
+  renderTestBox();
+  $("startBtn").onclick = async () => {
+    const night = document.querySelector("input[name=mode]:checked").value === "nightly";
+    const warn = "This will wipe the app's data and log the test accounts in and out on the phone, and it creates real groups and invitations on the staging accounts.\n\n";
+    let req, ask;
+    if (night) {
+      req = { kind: "nightly", config: $("cfgSel").value };
+      if (!req.config) return runMsg("No nightly config found.", "bad");
+      ask = warn + "Start the nightly from " + req.config + "? It can run for an hour or more.";
+    } else {
+      const picked = checkedTests(), s = suiteObj();
+      if (!picked.length) return runMsg("Select at least one test.", "bad");
+      req = { kind: "suite", suite: s.name, tests: picked.length === s.tests.length ? [] : picked, repeat: parseInt($("repeat").value, 10) || 1 };
+      ask = warn + "Start " + (req.tests.length ? picked.length + " selected test(s)" : "all " + picked.length + " tests") + " of " + s.name + (req.repeat > 1 ? ", " + req.repeat + " times each" : "") + "?";
+    }
+    if (!confirm(ask)) return;
+    try { const r = await post("/api/run", req); runMsg("Started: " + r.what + ". It should show up above within a few seconds.", "good"); refresh(); }
+    catch (e) { runMsg(e.message, "bad"); }
+  };
+  $("stopBtn").onclick = async () => {
+    if (!confirm("Stop the run now? The phone's animation settings are put back. A nightly stopped midway writes no report.")) return;
+    try { const r = await post("/api/stop"); runMsg("Stopped: " + r.stopped, "good"); refresh(); } catch (e) { runMsg(e.message, "bad"); }
+  };
+}
+function updateRunPanel(ov) {
+  run.busy = ov.processes.length > 0;
+  $("startBtn").disabled = run.busy; $("stopBtn").style.display = run.busy ? "" : "none";
+  if (run.busy) $("runpanel").open = true;
+  const L = ov.launch;
+  $("launchmsg").innerHTML = L && L.exit != null && L.exit !== 0 && ov.now - L.started < 900
+    ? `<div class="card"><b class="err">The last run started from here ended with an error (exit ${L.exit}): ${esc(L.what)}</b><pre class="log">${esc(L.tail.join("\n"))}</pre></div>` : "";
+}
+
 async function refresh() {
   try {
     const ov = await api("/api/overview");
     state.overview = ov;
     let key = state.sel;
     if (key === "auto") key = ov.default ? viewKey(ov.default) : null;
-    renderSelector(ov);
+    renderSelector(ov); updateRunPanel(ov);
     if (!key) { $("banner").innerHTML = '<div class="dot"></div><div class="big">No runs found yet</div>'; return; }
     const v = await api(viewUrl(key));
     state.view = v;
@@ -373,6 +480,7 @@ async function refresh() {
   } catch (e) { $("banner").innerHTML = `<div class="dot fail"></div><div class="big">Cannot reach the dashboard server</div><div class="sub">Start it with ./dashboard.py</div>`; }
 }
 $("viewSel").onchange = (e) => { state.sel = e.target.value; refresh(); };
+initRun();
 refresh();
 setInterval(refresh, 3000);
 </script>
