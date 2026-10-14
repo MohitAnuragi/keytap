@@ -6,6 +6,7 @@ Modes:
   fast   - fixed 300ms gap between each action
   step   - advance manually by calling advance()
 """
+import re
 import threading
 import time
 
@@ -110,6 +111,7 @@ class ActionReplayer:
         self._on_status = on_status
         self._serial = serial
         self._skip_left = 0
+        self._blockers = list(getattr(recording, "blockers", None) or [])
         actions.set_sync(True)   # each step finishes before the next starts
         total = len(recording.actions)
 
@@ -162,12 +164,14 @@ class ActionReplayer:
             retries = action.retries if action.retries is not None else self.default_retries
             started = time.time()
             attempt = 0
+            swept = []
             if not skipped and ok:
                 ok, error = self._execute_safe(action, serial)
                 while (not ok and attempt < retries and not self._stop_event.is_set()
                        and not error.startswith("uiautomator2 unavailable")):
                     attempt += 1
                     on_status(f"[RETRY {attempt}/{retries}] step {i + 1}: {error}")
+                    swept += self._clear_blockers()   # a dialog may be what made the step fail
                     time.sleep(self.RETRY_PAUSE_S)
                     ok, error = self._execute_safe(action, serial)
             warn, self._warn = self._warn, ""
@@ -179,6 +183,8 @@ class ActionReplayer:
             }
             if action.origin:
                 entry["origin"] = action.origin
+            if swept:
+                entry["swept"] = swept
             self.results.append(entry)
             if warn:
                 on_status(f"[WARN] step {i + 1}: {warn}")
@@ -423,6 +429,47 @@ class ActionReplayer:
             return f"{dev.app_current().get('activity', '?').split('.')[-1]} {t[:limit]}"
         except Exception as e:
             return f"unreadable ({type(e).__name__})"
+
+    MAX_SWEEPS = 6        # dialogs closed in a row before a sweep gives up
+
+    @staticmethod
+    def _blocker_matches(node, b):
+        """Does this hierarchy node match a suite.json "blockers" entry? All the keys given must match."""
+        rid, want = node.get("resource-id") or "", b.get("resource_id") or ""
+        if not (want or b.get("content_desc") or b.get("text")):
+            return False
+        if want and rid != want and not (":" not in want and rid.endswith(":id/" + want)):
+            return False
+        if b.get("content_desc") and node.get("content-desc") != b["content_desc"]:
+            return False
+        if b.get("text") and node.get("text") != b["text"]:
+            return False
+        return not b.get("class_name") or node.get("class") == b["class_name"]
+
+    def _clear_blockers(self):
+        """One screen read, checked against every known dialog at once; tap the first that is there and
+        look again, so dialogs that come one after another are all closed. Returns what it closed."""
+        closed = []
+        if not self._blockers or self._u2_dev is None:
+            return closed
+        import xml.etree.ElementTree as ET
+        for _ in range(self.MAX_SWEEPS):
+            try:
+                root = ET.fromstring(self._u2_dev.dump_hierarchy())
+            except Exception:
+                break
+            hit = next(((b, n) for b in self._blockers for n in root.iter("node") if self._blocker_matches(n, b)), None)
+            m = hit and re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", hit[1].get("bounds") or "")
+            if not m:
+                break
+            x1, y1, x2, y2 = map(int, m.groups())
+            actions.tap((x1 + x2) // 2, (y1 + y2) // 2)
+            name = hit[0].get("text") or hit[0].get("content_desc") or hit[0].get("resource_id")
+            closed.append(name)
+            if self._on_status:
+                self._on_status(f"[SWEEP] closed '{name}'")
+            time.sleep(0.8)
+        return closed
 
     MAX_RETAPS = 2        # extra taps when the screen did not change
     RETAP_WAIT_S = 1.5    # how long to watch for a change after each tap

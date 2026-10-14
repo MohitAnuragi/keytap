@@ -112,6 +112,8 @@ class Recording:
     # correlated per-frame timeline (actions + logcat + network, sorted by t)
     timeline: List[dict] = field(default_factory=list)
     video_path: Optional[str] = None   # relative path to screen.mp4 inside recording dir
+    # selectors of dialogs that may cover the app (suite.json "blockers"); a failing step closes them, then retries
+    blockers: List[dict] = field(default_factory=list)
 
     def save(self, screenshots: Optional[dict] = None,
              video_src_path: Optional[str] = None) -> str:

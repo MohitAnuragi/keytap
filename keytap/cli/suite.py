@@ -37,6 +37,9 @@ suite.json:
    "tests": "tests/*",                       a glob (alphabetical) or a list (run in that order)
    "needs": {"card_test": ["seed_test"]},    tests that must run first (listed earlier in "tests"); picking
                                              card_test by name or --tag adds seed_test before it
+   "blockers": [{"text": "Not now"}],        dialogs that may cover the app. When a step fails and is about to be retried,
+                                             one screen read is checked against all of them, the ones found are tapped,
+                                             then the step retries (so a surprise dialog costs a retry, not a test)
    "reuse_ok": ["card_test"],                tests that only read what their "needs" test left behind, so a
                                              caller who knows that state is still fresh may skip the prerequisite
                                              (nightly.py does, with run --skip-needs seed_test)
@@ -95,6 +98,10 @@ def load_suite(root):
     needs = suite.get("needs", {})
     if not isinstance(needs, dict) or not all(isinstance(v, list) for v in needs.values()):
         raise SuiteError('suite.json "needs" must map a test name to a list of test names')
+    blockers = suite.get("blockers", [])
+    if not isinstance(blockers, list) or not all(
+            isinstance(b, dict) and (b.get("resource_id") or b.get("content_desc") or b.get("text")) for b in blockers):
+        raise SuiteError('suite.json "blockers" must be a list of selectors, each with resource_id, content_desc or text')
     reuse_ok = suite.get("reuse_ok", [])
     if not isinstance(reuse_ok, list) or not all(isinstance(n, str) for n in reuse_ok):
         raise SuiteError('suite.json "reuse_ok" must be a list of test names')

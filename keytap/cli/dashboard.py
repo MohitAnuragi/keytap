@@ -132,7 +132,7 @@ def parse_log(path):
         elif ln.startswith("[RETAP"):
             s["retaps"] += 1
             s["notes"].append(ln)
-        elif ln.startswith(("[WARN]", "[RETYPE")):
+        elif ln.startswith(("[WARN]", "[RETYPE", "[SWEEP]")):
             s["notes"].append(ln)
     return steps, lines[-40:]
 
@@ -436,7 +436,7 @@ def steps_of(run_dir):
     j = _json(run_dir / "result.json")
     if j:
         steps = [{"n": s["step"], "label": s["label"], "status": s["status"], "ms": s["ms"], "retries": s.get("retries", 0),
-                  "origin": (s.get("origin") or "").split(" <- ")[0], "error": s.get("error")} for s in j["steps"]]
+                  "origin": (s.get("origin") or "").split(" <- ")[0], "error": s.get("error"), "swept": s.get("swept")} for s in j["steps"]]
         return {"done": True, "steps": steps, "failure": j.get("failure"), "anr": bool(j.get("anr")), "tail": []}
     steps, tail = parse_log(run_dir / "replay.log")
     out = []

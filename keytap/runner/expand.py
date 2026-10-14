@@ -159,10 +159,12 @@ def load_recording(path, root=None, params=None, vars_=None, resolve_env=True, s
     root = root or find_root(path)
     data, _ = _read(path)
     vars_ = vars_ if vars_ is not None else new_vars()
+    blockers = []
     if root:
         with open(os.path.join(root, "suite.json")) as f:
             if "package" in (suite := json.load(f)):
                 vars_.setdefault("package", suite["package"])
+        blockers = _subst(suite.get("blockers") or [], {}, vars_, False, False)[0]
     header, actions = _expand(path, root, params or {}, vars_, resolve_env, strict, ())
     rec = Recording(
         name=data.get("name", os.path.basename(os.path.normpath(path))),
@@ -170,5 +172,6 @@ def load_recording(path, root=None, params=None, vars_=None, resolve_env=True, s
         serial=data.get("serial", ""),
         device_resolution=data.get("device_resolution", [0, 0]),
         actions=Recording._parse_actions(actions),
+        blockers=blockers,
     )
     return rec, header

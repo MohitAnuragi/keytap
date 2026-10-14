@@ -356,7 +356,8 @@ async function loadOpenRun() {
       const failed = s.status === "fail", retried = s.retries > 0 && !failed;
       const cls = failed ? "failed" : s.status === "running" ? "running" : retried ? "retried" : s.status === "skip" ? "skip" : "";
       const res = failed ? "Failed" : s.status === "running" ? "Running" + (s.waiting ? " (waiting for it)" : "") : s.status === "skip" ? "Skipped" : s.status === "warn" ? "Warning" : retried ? `Passed after ${s.retries} retr${s.retries > 1 ? "ies" : "y"}` : "Passed";
-      h += `<tr class="${cls}"><td>${s.n}</td><td class="lbl">${esc(plain(s.label))}${s.error ? `<div class="err">${esc(s.error)}</div>` : ""}</td><td class="hide-sm muted">${esc(s.origin)}</td><td>${s.ms != null ? (s.ms / 1000).toFixed(1) + "s" : ""}</td><td>${res}</td></tr>`;
+      const swept = s.swept && s.swept.length ? `<div class="muted">closed a dialog: ${esc(s.swept.join(", "))}</div>` : "";
+      h += `<tr class="${cls}"><td>${s.n}</td><td class="lbl">${esc(plain(s.label))}${s.error ? `<div class="err">${esc(s.error)}</div>` : ""}</td><td class="hide-sm muted">${esc(s.origin)}</td><td>${s.ms != null ? (s.ms / 1000).toFixed(1) + "s" : ""}</td><td>${res}${swept}</td></tr>`;
     });
     h += `</tbody></table>`;
     const run = findRun(state.openRun);
