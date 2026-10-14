@@ -14,6 +14,9 @@ Placeholders in any string of an action:
 "when": {selector} on any step (or run step) runs it only if that element shows up within
 "when_timeout_ms" (default 8000), else skips it. On a run step it guards the whole flow, decided once
 when the flow starts, so the flow's own taps may make the element vanish.
+"when_else": {selector} or [selectors], next to a "when", say what shows instead when the "when" element
+is not coming. Whichever appears first decides, so a skipped step costs about a second, not the whole
+"when_timeout_ms". If both are on screen, the "when" element wins.
 
 Flows are folders with an actions.json, found relative to the suite folder (the nearest parent
 holding suite.json). Includes may nest 3 deep; loops are an error.
@@ -138,7 +141,8 @@ def _expand(path, root, params, vars_, resolve_env, strict, stack):
         if cond and inner:
             if inner[0].get("when") or inner[0].get("unless"):
                 raise LoadError(f'run step "{a["flow"]}": has "{cond}", and its first step has a condition too')
-            inner[0].update({cond: a[cond], "when_span": len(inner), "when_timeout_ms": a.get("when_timeout_ms")})
+            inner[0].update({cond: a[cond], "when_span": len(inner), "when_timeout_ms": a.get("when_timeout_ms"),
+                             "when_else": a.get("when_else")})
         start = a.get("t", 0) + shift
         for ia in inner:
             ia["t"] += start

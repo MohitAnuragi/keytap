@@ -126,10 +126,12 @@ Optional fields on a step. A selector is the same object an `element_tap` uses, 
 | Option | On | What it does | Use when |
 |---|---|---|---|
 | `"when": {selector}` | any step or `run` step | Runs only if the element shows within `when_timeout_ms` (default 8000), else the step is skipped and shown as `skip`. On a `run` step it guards the whole flow, decided once at its start | A screen only appears sometimes (OTP prompt, first-run intro). When the element is absent you pay the full timeout, so keep it short |
+| `"when_else": [{selector}]` | next to a `when` | Say what shows instead when the `when` element is not coming. Whichever shows first decides, so a skipped step costs about a second, not the whole timeout. Ties go to `when` | A step needs a short wait to be safe but an absent screen should not cost the full timeout (optional onboarding screens) |
 | `"unless": {selector}` | any step or `run` step | The opposite: runs only if the element is NOT on screen (polls 2 s) | Skip recovery steps when you are already where you want to be |
 | `"expect": {selector}` | tap steps | Taps, then retaps until the selector appears | A tap gets dropped during a transition. Only for taps that are safe to repeat, never create or send |
 | `"verify": true` | `input_text` | Checks the typed text is on screen, clears and retypes (up to 2 times) if not | Typed text arrives short or empty |
 | `"needs"` | `suite.json` | `{"card_test": ["seed_test"]}`: `suite.py run` adds the prerequisite tests and runs them first; `suite.py check` errors if they are listed after | One test creates data another needs |
+| `"reuse_ok"` | `suite.json` | List of tests that only read what their `needs` test left behind. `nightly.py` skips the prerequisite for them (`suite.py run --skip-needs seed_test`) while the seed passed earlier tonight and nothing that could change its state ran since; a retry always reseeds | Several tests read one seed and the nightly runs each test on its own |
 
 Placeholders in any string of an action: `{{param}}` from a `run` step, `{{ts}}` a per-run timestamp, `{{package}}` the `"package"` in `suite.json` (a `run` step's own `package` param wins), `{{env:NAME}}` an environment variable (kept out of files, shown as `***` in logs).
 

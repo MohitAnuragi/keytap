@@ -77,9 +77,33 @@ def preflight(root, suite, test, cfg):
     return ", ".join(sorted(used))
 
 
-def run_test(suite_dir, name, out, cfg):
-    """One run of one test through suite.py. Returns the test's entry from its summary.json."""
+def reusable_needs(suite, test_name, fresh):
+    """The prerequisites of this test that may be skipped: it is in "reuse_ok" (it only reads their state)
+    and each one passed earlier tonight with nothing since that could have changed what it left behind."""
+    if test_name not in suite.get("reuse_ok", []):
+        return []
+    return [n for n in suite.get("needs", {}).get(test_name, []) if n in fresh]
+
+
+def fresh_after(suite, test_name, status, fresh):
+    """Which prerequisites' state is still fresh once this test has finished. Anything that is not a seed
+    and not in "reuse_ok" (a login, a test that consumes invitations) or that failed starts the chain over."""
+    needs = suite.get("needs", {})
+    if status not in ("pass", "recovered"):
+        return set()
+    if test_name in {n for v in needs.values() for n in v}:
+        return {test_name}
+    if test_name in suite.get("reuse_ok", []):
+        return fresh | set(needs.get(test_name, []))   # a retry runs with its needs, so they are fresh again too
+    return set()
+
+
+def run_test(suite_dir, name, out, cfg, skip=()):
+    """One run of one test through suite.py. Returns the test's entry from its summary.json.
+    skip: prerequisite tests suite.py must not add first (see reusable_needs)."""
     cmd = [sys.executable, "suite.py", "run", suite_dir, name, "--exact", "--repeat", "1", "--quiet", "--out", out]
+    if skip:
+        cmd += ["--skip-needs", ",".join(skip)]
     if cfg["serial"]:
         cmd += ["--serial", cfg["serial"]]
     fail = {"status": "fail", "step": 0, "action": "", "failure": None, "screenshot": None}
@@ -115,9 +139,14 @@ def run_night(cfg, dry_run=False):
     if dry_run:
         for root, suite, tests in suites:
             print(f"{os.path.basename(root)}  ({suite['package']})")
+            fresh = set()   # assumes every test passes
             for t in tests:
                 why = preflight(root, suite, t, cfg)
-                print(f"  {t['name']:<32} " + (f"SKIP: {why}" if why else "run"))
+                reuse = reusable_needs(suite, t["name"], fresh)
+                print(f"  {t['name']:<32} " + (f"SKIP: {why}" if why else
+                      "run" + (f" (reuses {', '.join(reuse)})" if reuse else "")))
+                if not why:
+                    fresh = fresh_after(suite, t["name"], "pass", fresh)
         return 0
 
     night = DATA_DIR / "nightly" / time.strftime("%Y%m%d_%H%M%S")
@@ -143,6 +172,7 @@ def run_night(cfg, dry_run=False):
         sname, pkg = os.path.basename(root), suite["package"]
         builds[sname] = build_id(pkg)
         audit("build", suite=sname, build=builds[sname])
+        fresh = set()   # seed tests whose state is still fresh, see reusable_needs
         for test in tests:
             r = {"suite": sname, "test": test["name"], "status": "not_run", "cause": "", "detail": "", "attempts": []}
             results.append(r)
@@ -166,7 +196,10 @@ def run_night(cfg, dry_run=False):
                            "step": 0, "action": "", "failure": None, "screenshot": None}
                 else:
                     out = str(night / sname / test["name"] / f"attempt_{n:02d}")
-                    res = run_test(root, test["name"], out, cfg)
+                    skip = reusable_needs(suite, test["name"], fresh) if n == 1 else []   # a retry reseeds
+                    if skip:
+                        audit("reuse", suite=sname, test=test["name"], skipped_needs=skip)
+                    res = run_test(root, test["name"], out, cfg, skip)
                     if res["failure"]:
                         res["failure"] = os.path.join(out, res["failure"])
                     if res["screenshot"]:
@@ -201,6 +234,8 @@ def run_night(cfg, dry_run=False):
                             cfg["model"], json.loads(Path(last["failure"], "failure.json").read_text())))
                     if cfg["model"] and last["cause"] == "element_not_found" and last["failure"]:
                         r["proposal"] = propose_fix(audit, cfg, test, sname, night, last)
+            if r["attempts"]:
+                fresh = fresh_after(suite, test["name"], r["status"], fresh)
             if abort:
                 audit("abort", why=abort)
 

@@ -72,6 +72,9 @@ class Action:
     # length of the expanded flow.
     when: Optional[dict] = None
     unless: Optional[dict] = None     # the opposite: run only if this selector is NOT on screen after ~2s
+    # with "when": a list of selectors that mean "the when element is not coming". Whichever shows first
+    # decides: the when element runs the step, one of these skips it at once instead of after the timeout.
+    when_else: Optional[list] = None
     when_timeout_ms: Optional[int] = None
     when_span: Optional[int] = None
     # input_text only: after typing, read the focused field and set the text directly if characters were
@@ -235,7 +238,7 @@ class Recording:
                 direction=a.get("direction"),
                 check=a.get("check"), value=a.get("value"), soft=a.get("soft"),
                 optional=a.get("optional"),
-                when=a.get("when"), unless=a.get("unless"), when_timeout_ms=a.get("when_timeout_ms"), when_span=a.get("when_span"),
+                when=a.get("when"), unless=a.get("unless"), when_else=_as_list(a.get("when_else")), when_timeout_ms=a.get("when_timeout_ms"), when_span=a.get("when_span"),
                 expect=a.get("expect"), verify=a.get("verify"),
                 retap_if_unchanged=a.get("retap_if_unchanged"),
                 flow=a.get("flow"), params=a.get("params"),
@@ -362,6 +365,11 @@ def _is_count(v):
     return isinstance(v, int) and not isinstance(v, bool) and v >= 0
 
 
+def _as_list(v):
+    """None stays None; one selector object becomes a one-item list."""
+    return [v] if isinstance(v, dict) else v
+
+
 def check_actions_file(path: str) -> List[str]:
     """Problems that would break loading or replaying this actions.json. Empty list = valid."""
     try:
@@ -432,6 +440,14 @@ def check_actions_file(path: str) -> List[str]:
                 if not isinstance(w, dict) or set(w) - _SELECTOR_KEYS or not (
                         w.get("resource_id") or w.get("content_desc") or w.get("text")):
                     problems.append(f'{where}: "{key}" must be a selector object with resource_id, content_desc or text')
+        if "when_else" in a:
+            alts = _as_list(a["when_else"])
+            if not a.get("when"):
+                problems.append(f'{where}: "when_else" needs a "when" on the same step')
+            if not alts or not all(isinstance(w, dict) and not set(w) - _SELECTOR_KEYS and (
+                    w.get("resource_id") or w.get("content_desc") or w.get("text")) for w in alts):
+                problems.append(f'{where}: "when_else" must be a selector object, or a list of them, '
+                                f'each with resource_id, content_desc or text')
         for opt in ("timeout_ms", "retries", "when_timeout_ms"):
             if opt in a and not _is_count(a[opt]):
                 problems.append(f'{where}: "{opt}" must be a whole number, 0 or more')

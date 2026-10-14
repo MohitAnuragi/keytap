@@ -238,10 +238,22 @@ class ActionReplayer:
             return why, True, None
         sel = ElementSelector(**action.when)
         timeout_s = (action.when_timeout_ms or self.WHEN_TIMEOUT_MS) / 1000
-        el, _ = self._wait_for_element(self._u2_dev, sel, timeout_s)
-        if el is not None:
-            return None, True, None
-        self._skip_left = (action.when_span or 1) - 1
+        if action.when_else:
+            alts = [ElementSelector(**w) for w in action.when_else]
+            winner = self._wait_for_first(self._u2_dev, [sel] + alts, timeout_s)
+            if winner == 0:
+                return None, True, None
+            self._skip_left = (action.when_span or 1) - 1
+            if winner is not None:
+                why = f"when '{self._describe(sel)}' not coming: '{self._describe(alts[winner - 1])}' showed first"
+                if self._on_status:
+                    self._on_status(f"[SKIP] {why}")
+                return why, True, None
+        else:
+            el, _ = self._wait_for_element(self._u2_dev, sel, timeout_s)
+            if el is not None:
+                return None, True, None
+            self._skip_left = (action.when_span or 1) - 1
         why = f"when '{self._describe(sel)}' not on screen after {timeout_s:g}s"
         if self._on_status:
             self._on_status(f"[SKIP] {why}")
@@ -499,6 +511,21 @@ class ActionReplayer:
             time.sleep(0.2)
 
         return None, last_exc
+
+    def _wait_for_first(self, dev, selectors, timeout_s: float):
+        """Index of the first selector to show up, checked in order on each poll (so index 0 wins a tie),
+        or None when none shows within timeout_s."""
+        deadline = time.time() + timeout_s
+        while True:
+            for i, sel in enumerate(selectors):
+                try:
+                    if self._find_element(dev, sel) is not None:
+                        return i
+                except Exception:
+                    pass
+            if time.time() >= deadline or self._stop_event.is_set():
+                return None
+            time.sleep(0.2)
 
     def _find_element(self, dev, selector: ElementSelector):
         return lookup.find_element(dev, selector)

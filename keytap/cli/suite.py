@@ -37,6 +37,9 @@ suite.json:
    "tests": "tests/*",                       a glob (alphabetical) or a list (run in that order)
    "needs": {"card_test": ["seed_test"]},    tests that must run first (listed earlier in "tests"); picking
                                              card_test by name or --tag adds seed_test before it
+   "reuse_ok": ["card_test"],                tests that only read what their "needs" test left behind, so a
+                                             caller who knows that state is still fresh may skip the prerequisite
+                                             (nightly.py does, with run --skip-needs seed_test)
    "defaults": {"wait": 10, "retries": 1}}   same as the replay.py flags
 
 login policy, per test (header "login") or suite default:
@@ -92,6 +95,9 @@ def load_suite(root):
     needs = suite.get("needs", {})
     if not isinstance(needs, dict) or not all(isinstance(v, list) for v in needs.values()):
         raise SuiteError('suite.json "needs" must map a test name to a list of test names')
+    reuse_ok = suite.get("reuse_ok", [])
+    if not isinstance(reuse_ok, list) or not all(isinstance(n, str) for n in reuse_ok):
+        raise SuiteError('suite.json "reuse_ok" must be a list of test names')
     login = suite["login"]
     if login and login.get("default", "once") not in ("once", "always", "never"):
         raise SuiteError('suite.json login "default" must be once, always or never')
@@ -227,6 +233,13 @@ def cmd_check(args):
             elif names.index(n) > names.index(test):
                 report("ERROR", "suite.json", f'needs: "{n}" must be listed before "{test}" in "tests"')
                 errors += 1
+    for n in suite.get("reuse_ok", []):
+        if n not in names:
+            report("ERROR", "suite.json", f'reuse_ok: "{n}" is not a test of this suite')
+            errors += 1
+        elif n not in suite.get("needs", {}):
+            report("ERROR", "suite.json", f'reuse_ok: "{n}" has no "needs", so there is nothing to reuse')
+            errors += 1
     items = [("flow", i) for i in list_flows(root)] + [("test", i) for i in list_items(root, suite["tests"])]
     if not any(k == "test" for k, _ in items):
         report("ERROR", "suite.json", f'no tests match "{suite["tests"]}"')
@@ -442,7 +455,23 @@ def cmd_run(args):
         print("no tests selected")
         return 2
     picked = tests
-    tests = add_needs(everything, picked, suite.get("needs", {}))
+    needs = suite.get("needs", {})
+    if args.skip_needs:
+        skip = [n for n in args.skip_needs.split(",") if n]
+        unknown = [n for n in skip if n not in {t["name"] for t in everything}]
+        if unknown:
+            print(f"--skip-needs: not tests of this suite: {', '.join(unknown)}")
+            return 2
+        picked_names = {t["name"] for t in picked}
+        not_ok = [t["name"] for t in picked if set(skip) & set(needs.get(t["name"], []))
+                  and t["name"] not in suite.get("reuse_ok", [])]
+        if not_ok:
+            print(f'--skip-needs: not allowed for {", ".join(not_ok)} (not in "reuse_ok" in suite.json)')
+            return 2
+        # a skipped test counts as already done: drop it from every needs list (and so what it needs)
+        needs = {k: [n for n in v if n not in skip or n in picked_names] for k, v in needs.items()}
+        print(f"needs skipped, assumed still fresh: {', '.join(skip)}")
+    tests = add_needs(everything, picked, needs)
     if len(tests) > len(picked):
         print("added because they are needed first: " + ", ".join(t["name"] for t in tests if t not in picked))
     from keytap.recorder.recording import check_actions_file
@@ -560,6 +589,7 @@ def main():
     p.add_argument("names", nargs="*", help="only tests whose name contains one of these")
     p.add_argument("--exact", action="store_true", help="names must equal a test's name, not just be part of it")
     p.add_argument("--tag", help="only tests with this tag")
+    p.add_argument("--skip-needs", metavar="TEST[,TEST]", help='do not add these prerequisite tests first; only for tests in "reuse_ok" (the caller knows their state is still fresh)')
     p.add_argument("--repeat", type=int, default=1, metavar="N", help="run each test N times (default: 1)")
     p.add_argument("--login", choices=["once", "always", "never"], help="force one login policy for every test")
     p.add_argument("--serial", metavar="ID", help="adb serial (default: the only attached phone)")
