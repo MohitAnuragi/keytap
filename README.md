@@ -196,6 +196,30 @@ keytap/                            the Python package
 
 Modules start each other with `python -m keytap.<package>.<module>` (see `keytap/core/paths.py`), so run everything from the repo folder or through the wrappers.
 
+## Contributing
+
+**Contributors wanted!** keytap is under active development and I'm actively looking for developers to help build it. Whether you're a mobile dev, QA engineer, or Python hacker, there's room to make an impact.
+
+### Ways to help
+
+- **Try it and report bugs** — open an issue with your device, Android version, and steps to reproduce
+- **Fix bugs and improve stability** across different devices, emulators, and OS versions
+- **Build new features** — new inspectors, recorder/replayer improvements, suite and nightly tooling
+- **Improve docs** — clearer setup guides, examples, and recording/suite walkthroughs
+- **Add tests** and improve cross-platform support (Linux, Windows)
+- Pick up ideas from the roadmaps in [`docs/`](docs/)
+
+### Getting started
+
+1. Fork the repo and clone your fork
+2. Create a branch from `development`: `git checkout -b my-feature development`
+3. Run `bash install.sh` to set up dependencies, then connect a device or emulator and run `python keytap.py`
+4. Make your changes, following the existing style in the package (see [Code layout](#code-layout))
+5. Test against a real device or emulator
+6. Open a pull request against `development` describing what you changed and why
+
+Not sure where to start? Open an issue to discuss an idea before you build it, and I'm happy to point you at something that fits your interests.
+
 ## License
 
 MIT
