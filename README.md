@@ -218,7 +218,7 @@ Modules start each other with `python -m keytap.<package>.<module>` (see `keytap
 5. Test against a real device or emulator
 6. Open a pull request against `development` describing what you changed and why
 
-Not sure where to start? Open an issue to discuss an idea before you build it, and I'm happy to point you at something that fits your interests.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for full details. Not sure where to start? Open an issue to discuss an idea before you build it, and I'm happy to point you at something that fits your interests.
 
 ## License
 
