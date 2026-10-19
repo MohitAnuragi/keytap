@@ -102,6 +102,62 @@ keytap --backend screenrecord   # fallback capture
 
 ---
 
+## Which thing do I use?
+
+| Thing | What it is | Use when |
+|---|---|---|
+| `keytap.py` (`keytap`) | Interactive keyboard control of the phone, plus the recorder | Recording a new flow, or poking at the phone by hand |
+| Recording | One saved sequence of steps (taps, text, asserts) in an `actions.json` | It is the raw material: record it, then edit the JSON |
+| `replay.py` | Runs one recording headless, no window | A quick one-off: play this flow now (login aliases use it) |
+| Flow (`suites/<x>/flows/`) | A recording meant to be reused, e.g. login or dismiss popups. Tests call it with a `run` step | The same steps are needed in many tests |
+| Test (`suites/<x>/tests/`) | A recording with assertions; it passes or fails | You want a check that something works |
+| Suite (`suite.py`, `suite.json`) | A folder of tests and flows plus defaults (retries, login policy, restart between tests) | Running several tests together and getting a pass/fail report |
+| Run (`data/runs/...`) | Output folder of one execution: `result.json`, plus screenshot, hierarchy and logcat on failure | Debugging why something failed |
+| `dashboard.py` | Local web page (http://127.0.0.1:8765) that follows runs live: what is running, every test and step, retries, failures, plus a "how a run works" page. Its Run panel can start and stop a suite run or a nightly (one at a time, through `run_suite.sh` and `run_nightly.sh`, behind a confirm dialog) | You want to see what a nightly or suite run is doing, or why it failed |
+| `nightly.py` | Unattended overnight loop over the suites in `nightly.json`, with phone and battery checks and a morning report | Running everything while you sleep |
+| `steer.py` | Small commands for an AI to drive the phone one step at a time, with a short numbered screen instead of the raw hierarchy (see below) | A one-off check you want an AI to do (run a flow, verify a screen) without building a test suite |
+
+In short: build with the recorder, try a flow with `replay.py`, run a feature's tests with `suite.py run`, run everything unattended with `nightly.py`.
+
+Turn the phone's animations off before replaying. With them on, steps that wait for a screen transition fail with `element_not_found`.
+
+### Letting an AI steer the phone (`steer.py`)
+
+For a one-time check (run a flow, see what a screen shows) a test suite is overkill. `steer.py` gives an AI small commands to drive the phone. A raw uiautomator dump is about 90 KB (roughly 25k tokens) per step; `steer.py screen` prints only the visible text and the tappable elements, numbered, about 120-250 tokens. On one invite workflow (11 observed steps) the screens cost about 1k tokens against about 190k for raw dumps (token counts are estimates, characters divided by 3.5).
+
+```
+./steer.py screen                          what is on screen, tappable items numbered
+./steer.py tap 5 | tap "Accept" [nth]      tap by number or by label, then print the new screen
+./steer.py type "text" | key back | swipe up | launch <package>
+./steer.py do "tap Chat" "tap Groups"      several steps in one call (labels only, money words refused)
+./steer.py flow <dir> --package <pkg>      replay a keytap flow in one call; a flow that wipes app data (clear_data) needs --allow-clear
+./steer.py see "is a dialog open?"         local vision model answers; the picture never reaches the AI
+./steer.py mark ; ./steer.py logs "regex"  count and a few logcat lines since the mark
+```
+
+Add `--quiet` to any action to print one line instead of the screen. `--find "regex"` prints only the matching lines (the numbers stay the screen's own, so `tap` still works) and `--top` prints only the topmost menu or sheet (renumbered from 1). The `steer-phone` Claude skill (in `skills/`) teaches an AI to use this instead of raw dumps. Switches and checkboxes print their state, e.g. `2 Auto-join groups [off]`, read from the hierarchy. `see` can be wrong about state such as the selected tab; trust the screen text first.
+
+### Step options (in `actions.json`)
+
+Optional fields on a step. A selector is the same object an `element_tap` uses, e.g. `{"text": "Groups"}`.
+
+| Option | On | What it does | Use when |
+|---|---|---|---|
+| `"when": {selector}` | any step or `run` step | Runs only if the element shows within `when_timeout_ms` (default 8000), else the step is skipped and shown as `skip`. On a `run` step it guards the whole flow, decided once at its start | A screen only appears sometimes (OTP prompt, first-run intro). When the element is absent you pay the full timeout, so keep it short |
+| `"when_else": [{selector}]` | next to a `when` | Say what shows instead when the `when` element is not coming. Whichever shows first decides, so a skipped step costs about a second, not the whole timeout. Ties go to `when` | A step needs a short wait to be safe but an absent screen should not cost the full timeout (optional onboarding screens) |
+| `"unless": {selector}` | any step or `run` step | The opposite: runs only if the element is NOT on screen (polls 2 s) | Skip recovery steps when you are already where you want to be |
+| `"expect": {selector}` | tap steps | Taps, then retaps until the selector appears | A tap gets dropped during a transition. Only for taps that are safe to repeat, never create or send |
+| `"verify": true` | `input_text` | Checks the typed text is on screen, clears and retypes (up to 2 times) if not | Typed text arrives short or empty |
+| `"needs"` | `suite.json` | `{"card_test": ["seed_test"]}`: `suite.py run` adds the prerequisite tests and runs them first; `suite.py check` errors if they are listed after | One test creates data another needs |
+| `"blockers"` | `suite.json` | List of selectors of dialogs that may cover the app (`[{"text": "Not now"}, {"resource_id": "android:id/aerr_wait"}]`). When a step fails and is about to be retried, one screen read is checked against all of them, the ones found are tapped (up to 6 in a row), and then the step retries. Costs nothing when nothing fails | Surprise dialogs and popups, without a wait-and-check step for each one in every flow |
+| `"reuse_ok"` | `suite.json` | List of tests that only read what their `needs` test left behind. `nightly.py` skips the prerequisite for them (`suite.py run --skip-needs seed_test`) while the seed passed earlier tonight and nothing that could change its state ran since; a retry always reseeds | Several tests read one seed and the nightly runs each test on its own |
+
+**Model help** (`suite.py run --llm [MODEL] [--llm-scope dialogs|navigate]`, or the dashboard's "Local model help"): when a step fails and the `blockers` explain nothing, the local model (Ollama, started if needed, the model must already be pulled) looks at the screen (a screenshot plus the list of on-screen labels, topmost layer first; `--llm-text` sends no screenshot) and may act. A tap is only accepted if it names a label that is really on screen. `dialogs` closes dialogs with their own buttons only; `navigate` also allows back, scrolling and any tap that is not about money. At most 2 calls per test and 3 actions per call, and a test that only passes after the model acted is reported as helped ("Passed with help"). In `nightly.json`, `"steer": "dialogs"` turns it on for the night.
+
+Placeholders in any string of an action: `{{param}}` from a `run` step, `{{ts}}` a per-run timestamp, `{{package}}` the `"package"` in `suite.json` (a `run` step's own `package` param wins), `{{env:NAME}}` an environment variable (kept out of files, shown as `***` in logs).
+
+---
+
 ## Keybindings
 
 | Key | Action |
@@ -118,6 +174,27 @@ keytap --backend screenrecord   # fallback capture
 | Esc | Exit current mode |
 
 ---
+
+## Code layout
+
+```
+keytap.py  replay.py  suite.py  nightly.py  dashboard.py  steer.py     commands, thin wrappers (run them from the keytap folder)
+install.sh  bootstrap.sh           install and one-liner setup
+docs/                              roadmaps and design notes
+skills/                            the harden-recording, harden-suite and steer-phone Claude skills (install.sh copies it to ~/.claude)
+data/  suites/                     your recordings, traces, heap dumps and test suites (gitignored)
+keytap/                            the Python package
+  core/       config, paths, settings, utils, fonts
+  device/     adb, actions, screen capture, logcat, element lookup
+  recorder/   recording format, recorder, replayer, network capture and replay, timeline
+  runner/     headless engine, run steps and placeholders, assertions, failure bundles
+  profiler/   perf traces, heap snapshots, HPROF parsing and analysis
+  inspectors/ permissions, developer options, shared prefs, remote config, memory
+  ui/         the window, palette, element overlay, themes, timeline viewer
+  cli/        the replay and suite commands
+```
+
+Modules start each other with `python -m keytap.<package>.<module>` (see `keytap/core/paths.py`), so run everything from the repo folder or through the wrappers.
 
 ## License
 

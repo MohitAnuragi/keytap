@@ -15,12 +15,12 @@ Record sequences of device actions (taps, swipes, text input, app launches) and 
 3. User performs actions normally (taps, swipes, element taps, key events, input text, launches).
 4. Double-shift → palette opens with `[STOP RECORDING]` pinned as top entry (highlighted).
 5. Select "Stop Recording" → inline name prompt in palette.
-6. Saved to `~/.keytap/recordings/<name>_<timestamp>.json`.
+6. Saved to `data/recordings/<name>_<timestamp>.json`.
 
 ### Replay
 
 1. Palette → "Action Recorder" → "Replay"
-2. Lists all recordings in `~/.keytap/recordings/` by name + date.
+2. Lists all recordings in `data/recordings/` by name + date.
 3. Select recording → preview action list shown in palette.
 4. Choose replay mode: Timed / Fast / Step.
 5. Replay runs. Status bar shows `[REPLAY 3/12] element_tap: btn_login`.
@@ -40,7 +40,7 @@ Record sequences of device actions (taps, swipes, text input, app launches) and 
 
 ## Action JSON Format
 
-File: `~/.keytap/recordings/<name>_<timestamp>.json`
+File: `data/recordings/<name>_<timestamp>.json`
 
 ```json
 {
@@ -142,7 +142,7 @@ On replay, each `element_tap` does a fresh u2 hierarchy dump to find the current
 
 ## Storage
 
-- Directory: `~/.keytap/recordings/`
+- Directory: `data/recordings/`
 - Filename: `<name>_<YYYYMMDD_HHMMSS>.json`
 - No size limit enforced; user manages files manually
 
@@ -160,15 +160,15 @@ On replay, each `element_tap` does a fresh u2 hierarchy dump to find the current
 ## Architecture
 
 New files:
-- `recorder.py` — `ActionRecorder` class: start/stop recording, event ingestion, save to disk
-- `replayer.py` — `ActionReplayer` class: load recording, execute actions with mode/delay logic
-- `recording.py` — dataclasses: `Recording`, `Action`, `ElementSelector`
+- `keytap/recorder/recorder.py` — `ActionRecorder` class: start/stop recording, event ingestion, save to disk
+- `keytap/recorder/replayer.py` — `ActionReplayer` class: load recording, execute actions with mode/delay logic
+- `keytap/recorder/recording.py` — dataclasses: `Recording`, `Action`, `ElementSelector`
 
 Modified files:
-- `actions.py` — emit events to `ActionRecorder` if recording active (observer hook)
-- `element_manager.py` — emit `element_tap` events with full selector on label tap
-- `palette_proc.py` — add "Action Recorder" top-level entry; show `[STOP RECORDING]` pin when recording; replay mode file picker + mode selector
-- `app.py` — hold `ActionRecorder` and `ActionReplayer` instances; wire palette results
+- `keytap/device/actions.py` — emit events to `ActionRecorder` if recording active (observer hook)
+- `keytap/ui/element_manager.py` — emit `element_tap` events with full selector on label tap
+- `keytap/ui/palette_proc.py` — add "Action Recorder" top-level entry; show `[STOP RECORDING]` pin when recording; replay mode file picker + mode selector
+- `keytap/ui/app.py` — hold `ActionRecorder` and `ActionReplayer` instances; wire palette results
 
 ---
 

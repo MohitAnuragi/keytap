@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # keytap install script
-# Installs Python dependencies, checks system tools, and registers the
-# `keytap` shell command in your ~/.zshrc or ~/.bash_profile.
+# Installs Python dependencies, checks system tools, registers the
+# `keytap` shell command in your ~/.zshrc or ~/.bash_profile, and installs the
+# Claude skills (harden-recording, harden-suite, steer-phone) into ~/.claude/skills so it works from any folder.
 #
 # Usage:
-#   bash install.sh
+#   bash install.sh               # full install
+#   bash install.sh --skill-only  # only (re)install the Claude skill, e.g. after editing it
 #
 # After install, open a new terminal and run:
 #   keytap
@@ -21,6 +23,30 @@ info()  { echo -e "${GREEN}[keytap]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[keytap]${NC} $*"; }
 error() { echo -e "${RED}[keytap]${NC} $*"; }
 
+# ── Claude skill ──────────────────────────────────────────────────────────────
+
+# Copies every folder in skills/ to ~/.claude/skills and writes this keytap folder's path into
+# it, so Claude can find replay.py when it is not started inside the keytap folder.
+install_skill() {
+    local src name dst
+    for src in "$KEYTAP_DIR"/skills/*/; do
+        [[ -f "$src/SKILL.md" ]] || continue
+        name="$(basename "$src")"
+        dst="$HOME/.claude/skills/$name"
+        rm -rf "$dst"
+        mkdir -p "$dst"
+        cp -R "$src." "$dst/"
+        find "$dst" -name '*.md' -exec sed -i.bak "s|__KEYTAP_DIR__|$KEYTAP_DIR|g" {} +
+        find "$dst" -name '*.bak' -delete
+        info "Installed Claude skill $name to $dst"
+    done
+}
+
+if [[ "${1:-}" == "--skill-only" ]]; then
+    install_skill
+    exit 0
+fi
+
 # ── Python ────────────────────────────────────────────────────────────────────
 
 PYTHON=$(command -v python3 || true)
@@ -35,7 +61,7 @@ info "Python $PY_VER found at $PYTHON"
 
 info "Installing Python dependencies..."
 
-PKGS=("av>=18.0" "numpy>=1.24" "Pillow>=9.0" "pygame>=2.0" "uiautomator2>=2.0" "mitmproxy>=10.0")
+PKGS=("av>=18.0" "numpy>=1.24" "Pillow>=9.0" "pygame>=2.0" "uiautomator2>=2.0" "mitmproxy>=10.0" "perfetto>=0.5")
 
 # Try plain install first; if PEP 668 blocks it (Homebrew/system Python),
 # retry with --user --break-system-packages which installs to ~/Library/Python.
@@ -141,6 +167,8 @@ if [[ $ADDED -eq 0 ]]; then
     info "Created ~/.zshrc with keytap function"
 fi
 
+install_skill
+
 # ── Done ──────────────────────────────────────────────────────────────────────
 
 echo ""
@@ -154,4 +182,7 @@ echo "  Options:"
 echo "      keytap --height 1000          # taller mirror window"
 echo "      keytap --backend screenrecord # fallback capture"
 echo "      keytap --serial emulator-5554 # target specific device"
+echo ""
+echo "  Claude skill (harden a recording, build a test suite): in Claude Code, ask it to harden a keytap recording or build a suite,"
+echo "  or run: ./replay.py --help"
 echo ""

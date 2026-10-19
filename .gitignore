@@ -17,3 +17,10 @@ build/
 *.swp
 *.swo
 /tmp/keytap_stream.fifo
+
+# runtime data: recordings, traces, heap dumps, settings
+/data/
+
+# your own test suites and their run results stay local (suite.py init suites/<name>)
+/suites/
+**/.runs/
