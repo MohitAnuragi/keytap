@@ -1,0 +1,69 @@
+name: Bug report
+description: Something in keytap isn't working as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for reporting a bug! The more detail you give, the faster it can be fixed.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, and what you expected to happen instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Run `keytap --serial ...`
+        2. Press ...
+        3. See error
+    validations:
+      required: true
+  - type: input
+    id: command
+    attributes:
+      label: Command you ran
+      placeholder: keytap --backend screenrecord
+  - type: input
+    id: device
+    attributes:
+      label: Device or emulator
+      placeholder: Pixel 7 / emulator-5554
+    validations:
+      required: true
+  - type: input
+    id: android
+    attributes:
+      label: Android version
+      placeholder: "14"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Host OS
+      placeholder: macOS 14.5 / Ubuntu 24.04
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Python and adb versions
+      placeholder: Python 3.12, adb 35.0.1
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Capture backend
+      options:
+        - scrcpy (default)
+        - screenrecord
+        - Not sure
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      description: Paste terminal output or drag in screenshots. Remove any secrets or personal data first.
+      render: shell
