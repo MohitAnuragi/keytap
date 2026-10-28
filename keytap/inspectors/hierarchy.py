@@ -11,6 +11,7 @@ try:
 except ImportError:
     HAS_U2 = False
 
+from keytap.core.config import ADB_PATH
 from keytap.core.utils import parse_bounds
 
 
@@ -63,7 +64,7 @@ def dump_hierarchy_tree(serial=None, u2_dev=None):
         _log.debug("dump_hierarchy() done in %.2fs (total %.2fs)", _time.time() - _t1, _time.time() - _t0)
         xml_str = xml_raw if isinstance(xml_raw, str) else xml_raw.decode()
     else:
-        cmd = ['adb']
+        cmd = [ADB_PATH]
         if serial:
             cmd += ['-s', serial]
         cmd += ['shell', 'uiautomator', 'dump', '/dev/stdout']

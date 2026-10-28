@@ -53,7 +53,7 @@ def open_nano(key, raw_json):
         pretty = json.dumps(json.loads(raw_json), indent=2)
     except Exception:
         pretty = raw_json
-    tmppath = "/tmp/keytap_litmus_detail.json"
+    tmppath = os.path.join(tempfile.gettempdir(), "keytap_litmus_detail.json")
     with open(tmppath, "w") as f:
         f.write(pretty)
     subprocess.Popen([

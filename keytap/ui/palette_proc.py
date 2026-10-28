@@ -5,7 +5,6 @@ Reads one JSON line from stdin, writes one JSON line to stdout on close.
 Input JSON keys:
   mode      : "palette" | "viewer"
   packages  : [str, ...]          (palette mode)
-  clipboard : str                 (palette mode)
   deeplinks : [str, ...]          (palette mode)
   serial    : str | null          (palette mode)
   title     : str                 (viewer mode)
@@ -44,6 +43,10 @@ from keytap.core.paths import LOG_FILE, ROOT, child_env, module_command
 
 _LOG_FILE = str(LOG_FILE)
 _log = logging.getLogger("keytap.palette")
+
+# Shortcut modifier: Cmd on macOS, Ctrl elsewhere
+_MOD     = "Command" if sys.platform == "darwin" else "Control"
+_MOD_TXT = "Cmd" if sys.platform == "darwin" else "Ctrl"
 
 # ── Feature flags ─────────────────────────────────────────────────────────────
 
@@ -198,7 +201,7 @@ class PaletteWindow:
         # ── Packages + built-ins ──────────────────────────────────────────────
         self._pkgs = data.get("packages", [])
         self._deeplinks = data.get("deeplinks", [])
-        self._clipboard = data.get("clipboard", "")
+        self._clipboard = self._read_clipboard()
 
         # Build full item list: (display, type, value)
         self._all_items = []
@@ -286,11 +289,12 @@ class PaletteWindow:
         self._lb.bind("<<ListboxSelect>>", self._on_lb_select)
         root.bind("<Return>",        self._on_enter)
         root.bind("<Escape>",        self._on_escape)
-        root.bind("<Command-r>",     self._on_refresh)
-        root.bind("<Command-s>",     self._on_sort)
-        root.bind("<Command-o>",     self._on_toggle_own)
-        root.bind("<Command-d>",     self._on_diff)
-        root.bind("<Command-i>",     self._on_inspect)
+        # Also bound on the entry so its own Ctrl bindings (Ctrl+D deletes a char) don't run first
+        for key, handler in (("r", self._on_refresh), ("s", self._on_sort),
+                             ("o", self._on_toggle_own), ("d", self._on_diff),
+                             ("i", self._on_inspect)):
+            for w in (root, self._entry):
+                w.bind(f"<{_MOD}-{key}>", handler)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Select first item
@@ -488,6 +492,12 @@ class PaletteWindow:
     def _on_down(self, _=None):
         self._move(1)
         return "break"
+
+    def _read_clipboard(self):
+        try:
+            return self.root.clipboard_get()
+        except tk.TclError:  # empty clipboard or non-text content
+            return ""
 
     def _on_refresh(self, _=None):
         if self.state == "hierarchy":
@@ -1341,7 +1351,7 @@ class PaletteWindow:
                          f"{f['jank_type'][:24]:<24}  {f['process'][-28:]}", f))
         self._set_trace_viewer(
             "Janky frames", rows,
-            f"{len(frames)} janky frames  |  sort: {self._trace_sort} (Cmd+S)  |  Enter=slices  Esc=back",
+            f"{len(frames)} janky frames  |  sort: {self._trace_sort} ({_MOD_TXT}+S)  |  Enter=slices  Esc=back",
             on_enter=self._on_trace_frame, on_back=self._enter_trace_results)
 
     def _on_trace_frame(self, lb_idx):
@@ -1461,7 +1471,7 @@ class PaletteWindow:
                          f"  {s.get('label', '')}", s))
         self._set_trace_viewer(
             "Snapshots", rows,
-            f"{len(rows)} snapshots  |  Enter=open  Cmd+D=diff vs previous  Esc=back",
+            f"{len(rows)} snapshots  |  Enter=open  {_MOD_TXT}+D=diff vs previous  Esc=back",
             on_enter=self._on_heap_snapshot, on_back=self._enter_memory)
 
     def _on_heap_snapshot(self, lb_idx):
@@ -1562,7 +1572,7 @@ class PaletteWindow:
                               [None] * len(head) + capped)
         scope = f"own: {prefix}" if self._heap_own and prefix else "all classes"
         more = f", top {len(capped)} of {len(shown)}" if len(shown) > len(capped) else ""
-        self._heap_footer = (f"{scope}{more}  |  sort: {key} (Cmd+S)  |  Cmd+O=own/all  |  "
+        self._heap_footer = (f"{scope}{more}  |  sort: {key} ({_MOD_TXT}+S)  |  {_MOD_TXT}+O=own/all  |  "
                              f"type to search all  |  Enter=instances (Bitmap: sizes)  Esc=back")
         self._viewer_search = (self._on_heap_class, self._heap_search)
         self._set_trace_viewer("Heap diff" if self._heap_old else "Heap",
@@ -1622,7 +1632,7 @@ class PaletteWindow:
         rows.append((f"  {'retained':>9} {'shallow':>9}  instance", None))
         rows += self._heap_insts
         self._set_trace_viewer("Instances", rows,
-                               f"largest {len(self._heap_insts)} by retained size  |  Enter=reference path  |  Cmd+I=what it holds  Esc=back",
+                               f"largest {len(self._heap_insts)} by retained size  |  Enter=reference path  |  {_MOD_TXT}+I=what it holds  Esc=back",
                                on_enter=self._on_heap_instance, on_back=self._show_heap_classes)
 
     def _on_heap_instance(self, lb_idx):
@@ -2043,7 +2053,7 @@ class PaletteWindow:
         if not rows:
             rows = [("  no bitmaps in this dump", None)]
         self._set_trace_viewer("Bitmaps", rows,
-                               f"sort: {self._hp_bitmap_sort} (Cmd+S)  |  ratio = bitmap pixels / view pixels  |  "
+                               f"sort: {self._hp_bitmap_sort} ({_MOD_TXT}+S)  |  ratio = bitmap pixels / view pixels  |  "
                                "type to filter by URL  |  Enter=details  Esc=back",
                                on_enter=self._on_hprof_bitmap, on_back=self._show_hprof_home)
 

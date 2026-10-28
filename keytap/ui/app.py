@@ -343,7 +343,6 @@ class KeyTap:
         data = {
             "mode":                  "palette",
             "packages":              self._packages,
-            "clipboard":             self._read_clipboard(),
             "deeplinks":             self._deeplinks,
             "serial":                ARGS.serial,
             "adb_path":              ADB_PATH,
@@ -426,14 +425,6 @@ class KeyTap:
         else:
             return
         self._after_action_recorded()
-
-    def _read_clipboard(self):
-        try:
-            return subprocess.run(
-                ["pbpaste"], capture_output=True, text=True, timeout=1
-            ).stdout
-        except Exception:
-            return ""
 
     # ── Palette pre-warming ───────────────────────────────────────────────────
 
