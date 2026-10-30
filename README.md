@@ -89,6 +89,12 @@ python app.py --cols 12 --rows 28 --height 900
 | `--rows` | 32 | Grid rows |
 | `--height` | 800 | Mirror window height (px) |
 
+## Contributors
+* [@sidsharma2002](https://github.com/sidsharma2002/)
+* [@MohitAnuragi](https://github.com/MohitAnuragi/)
+
+
+
 ## License
 
 MIT
